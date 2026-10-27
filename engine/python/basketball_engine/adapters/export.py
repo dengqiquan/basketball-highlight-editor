@@ -520,6 +520,8 @@ def run_atomic_ffmpeg(
             if stderr_stream is not None:
                 stderr_stream.close()
         validate_media_file(temporary)
+        if cancel_check and cancel_check():
+            raise PipelineCancelled("JOB_CANCELLED")
         temporary.replace(output_path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -635,3 +637,84 @@ def export_goal_clips(
         "duration_ms": total_ms,
         "processing_ms": round((time.perf_counter() - started) * 1000),
     }
+
+
+def probe_merge_input(path: Path) -> dict[str, Any]:
+    """Read only the stream properties needed to normalize a standalone clip."""
+    result = subprocess.run(
+        [resolve_media_tool("ffprobe"), "-v", "error", "-show_streams", "-of", "json", str(path)],
+        check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+    )
+    streams = json.loads(result.stdout).get("streams", [])
+    video = next((item for item in streams if item.get("codec_type") == "video"), None)
+    if not video or not video.get("width") or not video.get("height"):
+        raise ValueError(f"无法读取视频画面：{path}")
+    return {
+        "width": int(video["width"]),
+        "height": int(video["height"]),
+        "has_audio": any(item.get("codec_type") == "audio" for item in streams),
+    }
+
+
+def merge_existing_videos(
+    input_paths: list[Path],
+    output_path: Path,
+    progress_callback=None,
+    cancel_check=None,
+    process_callback=None,
+) -> str:
+    """Normalize arbitrary local clips, then concatenate in the supplied order."""
+    if len(input_paths) < 2:
+        raise ValueError("至少选择两个视频")
+    paths = [Path(path).expanduser().resolve() for path in input_paths]
+    output = normalize_output_path(Path(output_path).expanduser())
+    if output.suffix.lower() != ".mp4":
+        raise ValueError("合并视频只能导出 MP4")
+    if any(not path.is_file() for path in paths):
+        raise ValueError("找不到所选视频")
+    if output.resolve() in paths:
+        raise ValueError("MERGE_SOURCE_CONFLICT: 输出位置不能覆盖输入视频")
+    if len(set(paths)) != len(paths):
+        raise ValueError("请勿重复选择同一个视频")
+    output = validate_output_file(output)
+    first = probe_merge_input(paths[0])
+    width = max(2, first["width"] // 2 * 2)
+    height = max(2, first["height"] // 2 * 2)
+    with tempfile.TemporaryDirectory(prefix="bhe-merge-", dir=str(output.parent)) as temp_name:
+        temporary = Path(temp_name)
+        clips = []
+        codecs = video_codecs()
+        for index, path in enumerate(paths):
+            if cancel_check and cancel_check():
+                raise PipelineCancelled("JOB_CANCELLED")
+            info = first if index == 0 else probe_merge_input(path)
+            clip = temporary / f"clip_{index:04d}.mp4"
+
+            def command(codec):
+                args = [resolve_media_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error", "-i", str(path)]
+                if not info["has_audio"]:
+                    args += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+                args += [
+                    "-map", "0:v:0", "-map", "0:a:0" if info["has_audio"] else "1:a:0",
+                    "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p",
+                    *video_codec_options(codec), "-r", "30", "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                    "-af", "apad", "-shortest", "-movflags", "+faststart", str(clip),
+                ]
+                return args
+
+            codec = run_encoded_ffmpeg(
+                command, clip, codecs, cancel_check=cancel_check, process_callback=process_callback,
+            )
+            # Concat stream-copy needs exactly the same encoder for every clip.
+            codecs = [codec]
+            clips.append(clip)
+            if progress_callback:
+                progress_callback((index + 1) / (len(paths) + 1))
+        manifest = temporary / "concat.txt"
+        manifest.write_text("".join(concat_manifest_entry(path) for path in clips), encoding="utf-8")
+        run_atomic_ffmpeg(
+            [resolve_media_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "concat", "-safe", "0", "-i", str(manifest), "-c", "copy", str(output)],
+            output, cancel_check=cancel_check, process_callback=process_callback,
+        )
+    return str(output)

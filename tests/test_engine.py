@@ -16,6 +16,96 @@ from engine.python.basketball_engine.storage import ProjectStore
 from engine.python.basketball_engine.protocol import ProtocolError, parse_request
 
 
+def test_standalone_merge_requires_two_videos_without_a_project(tmp_path):
+    service = EngineService()
+    with pytest.raises(ProtocolError) as error:
+        service.handle("start_video_merge", {"input_paths": [str(tmp_path / "one.mp4")], "output_path": str(tmp_path / "out.mp4")})
+    assert error.value.code == "INVALID_REQUEST"
+
+
+def test_standalone_merge_runs_without_project_and_can_be_polled(tmp_path, monkeypatch):
+    sources = [tmp_path / "one.mp4", tmp_path / "two.mp4"]
+    for source in sources:
+        source.write_bytes(b"source")
+    output = tmp_path / "joined.mp4"
+    seen = []
+
+    def fake_merge(paths, target, **kwargs):
+        seen.extend(paths)
+        target.write_bytes(b"merged")
+        kwargs["progress_callback"](0.5)
+        return str(target)
+
+    monkeypatch.setattr("engine.python.basketball_engine.service.merge_existing_videos", fake_merge)
+    service = EngineService()
+    started = service.handle("start_video_merge", {"input_paths": [str(path) for path in sources], "output_path": str(output)})
+    job_id = started["job"]["id"]
+    for _ in range(100):
+        job = service.handle("get_video_merge", {"job_id": job_id})["job"]
+        if job["state"] == "completed":
+            break
+        time.sleep(0.01)
+    assert job["state"] == "completed"
+    assert job["progress"] == 1.0
+    assert seen == sources
+    assert output.read_bytes() == b"merged"
+    assert service.handle("cancel_video_merge", {"job_id": job_id})["job"]["state"] == "completed"
+
+
+def test_standalone_merge_rejects_overwriting_source(tmp_path):
+    sources = [tmp_path / "one.mp4", tmp_path / "two.mp4"]
+    for source in sources:
+        source.write_bytes(b"source")
+    with pytest.raises(ProtocolError) as error:
+        EngineService().handle("start_video_merge", {
+            "input_paths": [str(path) for path in sources], "output_path": str(sources[0]),
+        })
+    assert error.value.code == "MERGE_SOURCE_CONFLICT"
+
+
+def test_standalone_merge_requires_mp4_output(tmp_path):
+    sources = [tmp_path / "one.mp4", tmp_path / "two.mp4"]
+    for source in sources:
+        source.write_bytes(b"source")
+    with pytest.raises(ProtocolError) as error:
+        EngineService().handle("start_video_merge", {
+            "input_paths": [str(path) for path in sources],
+            "output_path": str(tmp_path / "joined.mov"),
+        })
+    assert error.value.code == "INVALID_REQUEST"
+
+
+def test_standalone_merge_cancels_running_job(tmp_path, monkeypatch):
+    from engine.python.basketball_engine.adapters.analysis import PipelineCancelled
+
+    sources = [tmp_path / "one.mp4", tmp_path / "two.mp4"]
+    for source in sources:
+        source.write_bytes(b"source")
+    entered = threading.Event()
+
+    def fake_merge(_paths, _output, **kwargs):
+        entered.set()
+        while not kwargs["cancel_check"]():
+            time.sleep(0.01)
+        raise PipelineCancelled("JOB_CANCELLED")
+
+    monkeypatch.setattr("engine.python.basketball_engine.service.merge_existing_videos", fake_merge)
+    service = EngineService()
+    job_id = service.handle("start_video_merge", {
+        "input_paths": [str(path) for path in sources],
+        "output_path": str(tmp_path / "joined.mp4"),
+    })["job"]["id"]
+    assert entered.wait(2)
+    service.handle("cancel_video_merge", {"job_id": job_id})
+    for _ in range(100):
+        job = service.handle("get_video_merge", {"job_id": job_id})["job"]
+        if job["state"] == "cancelled":
+            break
+        time.sleep(0.01)
+    assert job["state"] == "cancelled"
+    assert not (tmp_path / "joined.mp4").exists()
+
+
 def test_inspect_video_rejects_non_object_ffprobe_output(tmp_path: Path, monkeypatch):
     source = tmp_path / "invalid-metadata.mp4"
     source.write_bytes(b"video")

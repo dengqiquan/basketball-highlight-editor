@@ -7,6 +7,20 @@ abstract interface class EngineTransport {
 class EngineSession {
   EngineSession(this.client);
 
+  Future<JsonMap> startVideoMerge({
+    required List<String> inputPaths,
+    required String outputPath,
+  }) => client.request('start_video_merge', <String, dynamic>{
+    'input_paths': inputPaths,
+    'output_path': outputPath,
+  });
+
+  Future<JsonMap> getVideoMerge(String jobId) =>
+      client.request('get_video_merge', <String, dynamic>{'job_id': jobId});
+
+  Future<JsonMap> cancelVideoMerge(String jobId) =>
+      client.request('cancel_video_merge', <String, dynamic>{'job_id': jobId});
+
   final EngineTransport client;
 
   Future<JsonMap> hello() => client.request('hello', <String, dynamic>{});

@@ -5,6 +5,20 @@ final exportOutputPickerProvider = Provider((ref) => ExportOutputPicker());
 
 /// Keeps the native modal boundary replaceable in export regression tests.
 class ExportOutputPicker {
+  Future<List<String>> videoPaths({required String typeLabel}) async {
+    final files = await openFiles(
+      acceptedTypeGroups: [
+        XTypeGroup(
+          label: typeLabel,
+          extensions: ['mp4', 'mov', 'm4v', 'avi', 'mkv'],
+          mimeTypes: ['video/*'],
+          uniformTypeIdentifiers: ['public.movie'],
+        ),
+      ],
+    );
+    return [for (final file in files) file.path];
+  }
+
   Future<String?> mergedPath({required String typeLabel}) async {
     final location = await getSaveLocation(
       suggestedName: 'highlights.mp4',

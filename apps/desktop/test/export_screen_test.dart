@@ -14,6 +14,14 @@ import 'package:desktop/theme/app_theme.dart';
 void main() {
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
+  testWidgets('standalone merge opens beside return to review', (tester) async {
+    await _pumpFilterExport(tester, _FilterExportNotifier(const ProjectState()));
+    expect(find.byKey(const Key('open-standalone-merge')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('open-standalone-merge')));
+    await tester.pumpAndSettle();
+    expect(find.text('添加视频'), findsOneWidget);
+  });
+
   testWidgets('the goal effect picks one option and the total follows it', (
     tester,
   ) async {

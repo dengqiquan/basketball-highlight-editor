@@ -17,6 +17,7 @@ import '../../providers/export_output_picker.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/tokens.dart';
 import 'game_stats.dart';
+import 'standalone_video_merge_dialog.dart';
 
 /// Export 屏:汇总当前保留片段 + 合并/分别导出 CTA + 历史。
 ///
@@ -112,12 +113,28 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
                 ],
               ),
             ),
-            CsButton(
-              label: Text(l10n?.text('返回审核') ?? '返回审核'),
-              icon: LucideIcons.arrowLeft,
-              variant: CsButtonVariant.ghost,
-              size: CsButtonSize.sm,
-              onPressed: () => context.go('/review'),
+            Wrap(
+              spacing: Spacing.xs,
+              children: [
+                CsButton(
+                  key: const Key('open-standalone-merge'),
+                  label: Text(context.bheText('合并已有视频')),
+                  icon: LucideIcons.combine,
+                  variant: CsButtonVariant.ghost,
+                  size: CsButtonSize.sm,
+                  onPressed: () => showDialog<void>(
+                    context: context,
+                    builder: (_) => const StandaloneVideoMergeDialog(),
+                  ),
+                ),
+                CsButton(
+                  label: Text(l10n?.text('返回审核') ?? '返回审核'),
+                  icon: LucideIcons.arrowLeft,
+                  variant: CsButtonVariant.ghost,
+                  size: CsButtonSize.sm,
+                  onPressed: () => context.go('/review'),
+                ),
+              ],
             ),
           ],
         ),

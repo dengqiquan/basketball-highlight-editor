@@ -10,6 +10,94 @@ from engine.python.basketball_engine.adapters.export import build_clip_command, 
 from engine.python.basketball_engine.adapters import export
 
 
+def test_merge_existing_videos_keeps_input_order_and_adds_silent_audio(tmp_path, monkeypatch):
+    sources = [tmp_path / "first.mov", tmp_path / "second.mp4"]
+    for source in sources:
+        source.write_bytes(b"source")
+    commands = []
+    monkeypatch.setattr(export, "probe_merge_input", lambda path: {"width": 640, "height": 360, "has_audio": path == sources[0]})
+
+    def fake_run(command, output_path, **_kwargs):
+        commands.append(command)
+        output_path.write_bytes(b"video")
+
+    monkeypatch.setattr(export, "run_atomic_ffmpeg", fake_run)
+    output = tmp_path / "joined.mp4"
+    result = export.merge_existing_videos(sources, output)
+
+    assert result == str(output)
+    assert str(sources[0]) in commands[0]
+    assert str(sources[1]) in commands[1]
+    assert "anullsrc=channel_layout=stereo:sample_rate=48000" in commands[1]
+    assert commands[-1][-1] == str(output)
+    assert len(list(tmp_path.glob("bhe-merge-*"))) == 0
+
+
+def test_merge_existing_videos_rejects_input_as_output(tmp_path):
+    sources = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
+    for source in sources:
+        source.write_bytes(b"source")
+    with pytest.raises(ValueError, match="MERGE_SOURCE_CONFLICT"):
+        export.merge_existing_videos(sources, sources[0])
+
+
+def test_atomic_ffmpeg_does_not_publish_after_cancel_during_validation(tmp_path, monkeypatch):
+    output = tmp_path / "joined.mp4"
+    cancelled = False
+
+    class FakeProcess:
+        returncode = 0
+        stderr = None
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(export.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+
+    def validate(temporary):
+        nonlocal cancelled
+        temporary.write_bytes(b"video")
+        cancelled = True
+
+    monkeypatch.setattr(export, "validate_media_file", validate)
+    with pytest.raises(PipelineCancelled):
+        run_atomic_ffmpeg(["ffmpeg", "-i", "source.mp4", str(output)], output, cancel_check=lambda: cancelled)
+    assert not output.exists()
+
+
+def test_merge_existing_videos_combines_mixed_media(tmp_path):
+    try:
+        ffmpeg = export.resolve_media_tool("ffmpeg")
+    except FileNotFoundError:
+        pytest.skip("ffmpeg unavailable")
+    first, second = tmp_path / "first.mp4", tmp_path / "second.mov"
+    subprocess.run(
+        [ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=160x120:r=15:duration=0.6",
+         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.2",
+         "-c:v", "mpeg4", "-c:a", "aac", str(first)], check=True,
+    )
+    subprocess.run(
+        [ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=blue:s=120x160:r=24",
+         "-t", "0.6", "-c:v", "mpeg4", str(second)], check=True,
+    )
+    output = tmp_path / "joined.mp4"
+    assert export.merge_existing_videos([first, second], output) == str(output)
+    info = export.probe_merge_input(output)
+    assert info == {"width": 160, "height": 120, "has_audio": True}
+    assert output.stat().st_size > 0
+    duration = subprocess.run(
+        [export.resolve_media_tool("ffprobe"), "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(output)],
+        check=True, capture_output=True, text=True,
+    )
+    assert float(duration.stdout) > 1.1
+    frames = subprocess.run(
+        [export.resolve_media_tool("ffprobe"), "-v", "error", "-count_frames", "-select_streams", "v:0",
+         "-show_entries", "stream=nb_read_frames", "-of", "default=noprint_wrappers=1:nokey=1", str(output)],
+        check=True, capture_output=True, text=True,
+    )
+    assert int(frames.stdout) >= 34
+
+
 def test_libx264_clip_command_contains_one_video_codec():
     command = build_clip_command(Path("source.mp4"), 0, 1000, Path("out.mp4"), "libx264")
     assert command.count("-c:v") == 1
