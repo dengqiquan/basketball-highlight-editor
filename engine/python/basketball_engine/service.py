@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
-from . import __version__
+from . import __version__, ANALYSIS_ALGORITHM_VERSION
 from .adapters.analysis import (
     apply_rim_checks,
     build_pipeline_commands,
@@ -36,11 +36,14 @@ from .adapters.export import (
     ensure_writable_directory,
     export_goal_clips,
     merge_existing_videos,
+    merge_overlapping_candidates,
     normalize_output_path,
     safe_file_stem,
     trajectory_points,
     validate_output_file,
 )
+from .adapters.runtime_preflight import DetectorPreflight, runtime_error
+from basketball_highlight.runtime_errors import is_runtime_failure
 from .protocol import ProtocolError
 from .storage import ProjectStore, new_id
 from .media_tools import resolve_media_tool
@@ -49,7 +52,6 @@ from basketball_highlight.rim_check import RIM_CHECK_VERSION
 from basketball_highlight.tracking import link_ball_detections
 
 
-ANALYSIS_ALGORITHM_VERSION = "python-v2.15-crop-scale-clamp"
 
 
 class EngineService:
@@ -63,6 +65,7 @@ class EngineService:
         self._video_merge_jobs: dict[str, Dict[str, Any]] = {}
         self._store_lock = threading.Lock()
         self._job_lock = threading.Lock()
+        self._detector_preflight = DetectorPreflight()
 
     def shutdown(self, timeout: float = 5.0) -> None:
         with self._job_lock:
@@ -145,9 +148,6 @@ class EngineService:
             "update_clip_range": self.update_clip_range,
             "update_clip_ranges": self.update_clip_ranges,
             "start_export": self.start_export,
-            "start_video_merge": self.start_video_merge,
-            "get_video_merge": self.get_video_merge,
-            "cancel_video_merge": self.cancel_video_merge,
             "list_exports": self.list_exports,
             "get_statistics": self.get_statistics,
             "set_telemetry_consent": self.set_telemetry_consent,
@@ -167,96 +167,6 @@ class EngineService:
             "capabilities": list(self._handlers()),
             "analysis_runtime": ANALYSIS_ALGORITHM_VERSION,
         }
-
-    def start_video_merge(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        raw_paths = payload.get("input_paths")
-        raw_output = payload.get("output_path")
-        if (not isinstance(raw_paths, list) or len(raw_paths) < 2
-                or any(not isinstance(path, str) or not path.strip() for path in raw_paths)
-                or not isinstance(raw_output, str) or not raw_output.strip()):
-            raise ProtocolError("INVALID_REQUEST", "请选择至少两个视频和输出位置")
-        paths = [Path(path).expanduser().resolve() for path in raw_paths]
-        output = normalize_output_path(Path(raw_output).expanduser())
-        if output.suffix.lower() != ".mp4":
-            raise ProtocolError("INVALID_REQUEST", "合并视频只能导出 MP4")
-        if any(not path.is_file() for path in paths):
-            raise ProtocolError("FILE_NOT_FOUND", "找不到所选视频")
-        if len(set(paths)) != len(paths):
-            raise ProtocolError("INVALID_REQUEST", "请勿重复选择同一个视频")
-        if output.resolve() in paths:
-            raise ProtocolError("MERGE_SOURCE_CONFLICT", "输出位置不能覆盖输入视频")
-        try:
-            validate_output_file(output)
-        except OSError as exc:
-            raise ProtocolError("EXPORT_PATH_INVALID", str(exc)) from exc
-        job_id = new_id("merge")
-        job = {"id": job_id, "state": "queued", "progress": 0.0, "output_path": str(output)}
-        cancel_event = threading.Event()
-        with self._job_lock:
-            self._video_merge_jobs[job_id] = job
-            self._job_cancel_events[job_id] = cancel_event
-            self._job_processes[job_id] = set()
-        thread = threading.Thread(
-            target=self._run_video_merge, args=(job_id, paths, output, cancel_event),
-            name=f"video-merge-{job_id}", daemon=True,
-        )
-        with self._job_lock:
-            self._job_threads[job_id] = thread
-        thread.start()
-        return {"job": dict(job)}
-
-    def _run_video_merge(self, job_id: str, paths: list[Path], output: Path, cancel_event: threading.Event) -> None:
-        def update(**changes):
-            with self._job_lock:
-                self._video_merge_jobs[job_id].update(changes)
-
-        def process_changed(process):
-            with self._job_lock:
-                processes = self._job_processes[job_id]
-                processes.clear()
-                if process is not None:
-                    processes.add(process)
-
-        try:
-            update(state="running")
-            result = merge_existing_videos(
-                paths, output, progress_callback=lambda progress: update(progress=progress),
-                cancel_check=cancel_event.is_set, process_callback=process_changed,
-            )
-            update(state="completed", progress=1.0, output_path=result)
-        except PipelineCancelled:
-            update(state="cancelled", error_message="合并已取消")
-        except Exception as exc:
-            update(state="cancelled" if cancel_event.is_set() else "failed", error_message=str(exc))
-        finally:
-            with self._job_lock:
-                self._job_processes.pop(job_id, None)
-                self._job_cancel_events.pop(job_id, None)
-                self._job_threads.pop(job_id, None)
-
-    def get_video_merge(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        with self._job_lock:
-            job = self._video_merge_jobs.get(payload.get("job_id"))
-            if job is None:
-                raise ProtocolError("JOB_NOT_FOUND", "合并任务不存在")
-            return {"job": dict(job)}
-
-    def cancel_video_merge(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        job_id = payload.get("job_id")
-        processes = []
-        with self._job_lock:
-            job = self._video_merge_jobs.get(job_id)
-            if job is None:
-                raise ProtocolError("JOB_NOT_FOUND", "合并任务不存在")
-            if job["state"] in {"queued", "running"}:
-                event = self._job_cancel_events.get(job_id)
-                if event:
-                    event.set()
-                processes = list(self._job_processes.get(job_id, ()))
-                job["state"] = "cancelling"
-        for process in processes:
-            terminate_process(process)
-        return self.get_video_merge({"job_id": job_id})
 
     def _store(self, payload: Dict[str, Any]) -> ProjectStore:
         root_path = payload.get("project_root") or payload.get("root_path")
@@ -770,6 +680,12 @@ class EngineService:
 
     _validated_source = _validated_original_source
 
+    def _ensure_detector_ready(self, model_path, device, cancel_check=None, process_callback=None):
+        return self._detector_preflight.ensure(
+            Path(__file__).resolve().parents[3], model_path, device,
+            cancel_check=cancel_check, process_callback=process_callback,
+        )
+
     def suggest_roi(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Find a stable hoop in a short full-frame scan and suggest a ball ROI."""
         store = self._require_store(payload)
@@ -808,6 +724,8 @@ class EngineService:
         ):
             raise ProtocolError("INVALID_REQUEST", "自动 ROI 参数必须在有效范围内")
 
+        device = str(payload.get("device") or "auto").strip().lower()
+        self._ensure_detector_ready(model_path, device)
         output = store.root / "artifacts" / "detections" / f"roi_suggestion_{video_id}.json"
         script = repo_root / "scripts" / "detect_auto_roi.py"
         command = [
@@ -850,6 +768,10 @@ class EngineService:
             subprocess.TimeoutExpired,
             json.JSONDecodeError,
         ) as exc:
+            details = f"{exc}\n{getattr(exc, 'stderr', '') or ''}"
+            if is_runtime_failure(details):
+                self._detector_preflight.invalidate()
+                raise runtime_error(details) from exc
             raise ProtocolError("ROI_DETECTION_FAILED", f"自动 ROI 检测失败: {exc}") from exc
 
         if not result.get("success") or not isinstance(result.get("roi"), dict):
@@ -1615,6 +1537,17 @@ class EngineService:
                 f"roi_source={calibration.get('source', 'manual')} net_roi={net_roi is not None} "
                 f"proxy={proxy_width}x{proxy_height}@{proxy_fps:g}fps"
             )
+            cancel_event = self._job_cancel_events.get(job_id)
+            last_stage["name"] = "engine_preflight"
+            store.update_job(job_id, state="running", stage="engine_preflight", progress=0.01)
+            log_diagnostic(f"{label} stage=engine_preflight progress=0.01 elapsed={elapsed()}")
+            preflight_started = time.perf_counter()
+            self._ensure_detector_ready(
+                model_path, device,
+                cancel_check=cancel_event.is_set if cancel_event else None,
+                process_callback=lambda process: self._set_job_process(job_id, process),
+            )
+            preflight_ms = round((time.perf_counter() - preflight_started) * 1000)
             artifact_root = store.root / "artifacts"
             run_root = artifact_root / "detections" / f"{video_id}_{analysis_key}"
             proxy_video = artifact_root / "proxies" / f"{video_id}_{analysis_key}.mp4"
@@ -1680,7 +1613,7 @@ class EngineService:
             store.update_job(
                 job_id,
                 state="running",
-                stage="validate_input",
+                stage="engine_preflight",
                 progress=0.01,
                 checkpoint=checkpoint,
             )
@@ -1850,6 +1783,7 @@ class EngineService:
                 cancel_event=cancel_event,
             )
             stage_timings_ms = dict(pipeline.get("stage_timings_ms", {}))
+            stage_timings_ms["engine_preflight"] = preflight_ms
             stage_timings_ms["prepare_review_previews"] = round(
                 (time.perf_counter() - preview_started) * 1000
             )
@@ -1902,6 +1836,8 @@ class EngineService:
                 checkpoint=checkpoint_with_elapsed(),
             )
         except ProtocolError as exc:
+            if exc.code == "ENGINE_RUNTIME_UNAVAILABLE":
+                self._detector_preflight.invalidate()
             log_end("failed", exc.code, exc.message)
             store.update_job(
                 job_id,
@@ -1912,7 +1848,7 @@ class EngineService:
                 checkpoint=checkpoint_with_elapsed(),
             )
         except Exception as exc:
-            log_end("failed", "ANALYSIS_FAILED", f"{exc}\n{traceback.format_exc(limit=-4)}")
+            log_end("failed", "ANALYSIS_FAILED", traceback.format_exc(limit=-4))
             store.update_job(
                 job_id,
                 state="failed",
@@ -1987,6 +1923,9 @@ class EngineService:
             except PipelineCancelled:
                 raise
             except Exception as exc:
+                if isinstance(exc, ProtocolError) and exc.code == "ENGINE_RUNTIME_UNAVAILABLE":
+                    self._detector_preflight.invalidate()
+                    log_diagnostic(f"analysis job={job_id} verify_rim_crossing: {exc.message}")
                 # 复核失败不能丢掉整次分析:候选保持人工审核。
                 pipeline["logs"].append(f"verify_rim_crossing: {exc}")
                 output = None
@@ -2488,7 +2427,11 @@ class EngineService:
             "processing_ms": result["processing_ms"],
             "export_ms": result["processing_ms"],
             "algorithm_version": ANALYSIS_ALGORITHM_VERSION,
-            "metadata": {"files": result["files"], "clip_files": result["clip_files"]},
+            "metadata": {
+                "files": result["files"],
+                "clip_files": result["clip_files"],
+                "merged_overlap_count": result["merged_overlap_count"],
+            },
         })
         return {"export": export, "files": result["files"]}
 
@@ -2513,6 +2456,8 @@ class EngineService:
         clip_files: list[str] = []
         duration_ms = 0
         processing_ms = 0
+        merged_overlap_count = 0
+        sizes = [len(merge_overlapping_candidates(group)) if effect == "none" else len(group) for group in groups.values()]
         done = 0
         try:
             for index, (name, group) in enumerate(groups.items()):
@@ -2524,9 +2469,9 @@ class EngineService:
                         {"source_path": str(merged.resolve())},
                     )
 
-                def on_progress(stage: str, fraction: float, offset: int = done, size: int = len(group)) -> None:
+                def on_progress(stage: str, fraction: float, offset: int = done, size: int = sizes[index]) -> None:
                     if progress_callback:
-                        progress_callback(stage, (offset + fraction * size) / len(candidates))
+                        progress_callback(stage, (offset + fraction * size) / sum(sizes))
 
                 result = export_goal_clips(
                     group,
@@ -2542,15 +2487,18 @@ class EngineService:
                 clip_files.extend(result["clip_files"])
                 duration_ms += result["duration_ms"]
                 processing_ms += result["processing_ms"]
-                done += len(group)
+                merged_overlap_count += result["merged_overlap_count"]
+                done += sizes[index]
         except Exception:
             for path in files:
                 Path(path).unlink(missing_ok=True)
+            shutil.rmtree(work_root, ignore_errors=True)
             raise
         return {
             "files": files,
             "clip_files": clip_files,
             "duration_ms": duration_ms,
+            "merged_overlap_count": merged_overlap_count,
             "processing_ms": processing_ms,
         }
 
@@ -2789,7 +2737,7 @@ class EngineService:
                 error_message=exc.message,
             )
         except Exception as exc:
-            log_end("failed", "EXPORT_FAILED", f"{exc}\n{traceback.format_exc(limit=-4)}")
+            log_end("failed", "EXPORT_FAILED", traceback.format_exc(limit=-4))
             store.update_job(
                 job_id,
                 state="failed",
