@@ -561,6 +561,75 @@ def merge_overlapping_candidates(candidates):
     return merged
 
 
+def merge_duplicate_auto_candidates(candidates, max_event_gap_ms=2500):
+    """Join nearby automatic detections of one play before writing clips."""
+    def same_rim(left, right):
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return True
+        try:
+            width = max(float(left["width"]), float(right["width"]))
+            left_x = float(left.get("x", left.get("center_x")))
+            right_x = float(right.get("x", right.get("center_x")))
+            left_y = float(left.get("y", left.get("rim_y")))
+            right_y = float(right.get("y", right.get("rim_y")))
+            return (
+                abs(left_x - right_x) <= 1.5 * width
+                and abs(left_y - right_y) <= 1.5 * width
+            )
+        except (KeyError, TypeError, ValueError):
+            return True
+
+    groups = []
+    for index, candidate in sorted(
+        enumerate(candidates), key=lambda item: int(item[1]["event_time_ms"])
+    ):
+        event_time = int(candidate["event_time_ms"])
+        start = int(candidate["review_start_ms"])
+        end = int(candidate["review_end_ms"])
+        if start < 0 or end <= start:
+            raise ValueError("INVALID_CLIP_RANGE")
+        group = next((
+            group for group in groups
+            if not candidate.get("manual")
+            and not group["manual"]
+            and candidate["source_path"] == group["source_path"]
+            and candidate.get("player_name") == group["player_name"]
+            and same_rim(candidate.get("rim"), group["rim"])
+            and event_time - group["first_time"] <= max_event_gap_ms
+            and start <= group["end"]
+            and end >= group["start"]
+        ), None)
+        if group is None:
+            groups.append({
+                "members": [(index, candidate)],
+                "first_time": event_time,
+                "start": start,
+                "end": end,
+                "manual": bool(candidate.get("manual")),
+                "source_path": candidate["source_path"],
+                "player_name": candidate.get("player_name"),
+                "rim": candidate.get("rim"),
+            })
+        else:
+            group["members"].append((index, candidate))
+            group["start"] = min(group["start"], start)
+            group["end"] = max(group["end"], end)
+    merged = []
+    for group in sorted(groups, key=lambda item: min(index for index, _ in item["members"])):
+        members = [candidate for _, candidate in group["members"]]
+        winner = max(members, key=lambda item: (
+            item.get("review_status") == "goal",
+            int(item["event_time_ms"]),
+        ))
+        merged.append({
+            **winner,
+            "review_start_ms": group["start"],
+            "review_end_ms": group["end"],
+            "has_audio": all(bool(item.get("has_audio", True)) for item in members),
+        })
+    return merged
+
+
 def export_goal_clips(
     candidates: list[Dict[str, Any]],
     output_dir: Path,
@@ -573,11 +642,11 @@ def export_goal_clips(
 ) -> Dict[str, Any]:
     if mode not in {"separate", "merge"}:
         raise ValueError("INVALID_EXPORT_MODE")
-    merged_overlap_count = 0
+    original_count = len(candidates)
+    candidates = merge_duplicate_auto_candidates(candidates)
     if mode == "merge" and effect == "none":
-        merged = merge_overlapping_candidates(candidates)
-        merged_overlap_count = len(candidates) - len(merged)
-        candidates = merged
+        candidates = merge_overlapping_candidates(candidates)
+    merged_overlap_count = original_count - len(candidates)
     started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
     files: list[Path] = []

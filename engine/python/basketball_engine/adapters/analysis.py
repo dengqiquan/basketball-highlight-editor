@@ -95,6 +95,24 @@ def scale_roi_to_proxy(
     ]
 
 
+def focus_roi_on_net(roi: Sequence[float], net_roi: Sequence[float] | None) -> list[float]:
+    """Use an explicit net calibration to narrow an oversized detection crop."""
+    original = list(roi)
+    if net_roi is None or len(net_roi) != 4:
+        return original
+    x1, y1, x2, y2 = original
+    nx1, ny1, nx2, ny2 = net_roi
+    if not (x1 <= nx1 < nx2 <= x2 and y1 <= ny1 < ny2 <= y2):
+        return original
+    width, height = nx2 - nx1, ny2 - ny1
+    return [
+        max(x1, nx1 - 2 * width),
+        max(y1, ny1 - 2 * height),
+        min(x2, nx2 + 2 * width),
+        min(y2, ny2 + 2 * height),
+    ]
+
+
 def flatten_refined_matches(data: Dict[str, Any], dedupe_seconds: float = 2.0) -> list[Dict[str, Any]]:
     matches = [
         dict(match)

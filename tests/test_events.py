@@ -81,6 +81,44 @@ class EventsTest(unittest.TestCase):
         candidates = find_candidate_crossings(records, {"center_x": 490, "rim_y": 325, "width": 20})
         self.assertEqual(candidates, [])
 
+    def test_coarse_crossing_ignores_persistent_false_ball_at_hoop(self):
+        records = []
+        for frame in range(60):
+            detections = [{"name": "ball", "confidence": 0.7,
+                           "center": [394.0, 223.0]}]
+            if frame == 51:
+                detections.append({"name": "ball", "confidence": 0.5,
+                                   "center": [405.0, 220.0]})
+            if frame == 52:
+                detections.append({"name": "ball", "confidence": 0.5,
+                                   "center": [406.0, 255.0]})
+            records.append({"time": frame * 0.2, "detections": detections})
+
+        candidates = find_candidate_crossings(
+            records, {"center_x": 405, "rim_y": 238, "width": 22}
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["above"]["x"], 405.0)
+        self.assertEqual(candidates[0]["below"]["x"], 406.0)
+
+    def test_coarse_crossing_keeps_repeated_noncontinuous_ball_visits(self):
+        records = [
+            {"time": float(second), "detections": [
+                {"name": "ball", "confidence": 0.7, "center": [394.0, 223.0]}
+            ]}
+            for second in range(12)
+        ]
+        records.append({"time": 11.2, "detections": [
+            {"name": "ball", "confidence": 0.7, "center": [406.0, 255.0]}
+        ]})
+
+        candidates = find_candidate_crossings(
+            records, {"center_x": 405, "rim_y": 238, "width": 22}
+        )
+
+        self.assertTrue(any(candidate["below"]["time"] == 11.2 for candidate in candidates))
+
     def test_refined_crossing_requires_persistent_trajectory(self):
         records = [
             {"time": 1.0, "detections": [{"name": "ball", "confidence": 0.8, "center": [489, 295]}]},

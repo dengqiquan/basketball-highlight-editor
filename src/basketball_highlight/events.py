@@ -39,6 +39,49 @@ def _flatten_balls(records, min_conf=0.0):
     return balls
 
 
+def _without_stationary_balls(records):
+    """Discard long-lived fixed detections before coarse ball selection.
+
+    Backboard details can be labelled as a ball for minutes. Selecting the
+    highest confidence detection in each frame would then hide the real ball.
+    """
+    groups = {}
+    for record in records:
+        for item in record.get("detections", []):
+            if item["name"] != "ball":
+                continue
+            x, y = item["center"]
+            groups.setdefault((round(x / 8), round(y / 8)), []).append(
+                (float(record["time"]), x, y)
+            )
+    fixed = []
+    for points in groups.values():
+        run = []
+        for point in sorted(points):
+            if run and point[0] - run[-1][0] > 0.5:
+                run = []
+            run.append(point)
+            if len(run) < 12 or run[-1][0] - run[0][0] < 2:
+                continue
+            x = median(p[1] for p in run)
+            y = median(p[2] for p in run)
+            if sum((p[1] - x) ** 2 + (p[2] - y) ** 2 <= 16 for p in run) >= 12:
+                fixed.append((x, y))
+                break
+    if not fixed:
+        return records
+    return [
+        {**record, "detections": [
+            item for item in record.get("detections", [])
+            if item["name"] != "ball" or all(
+                (item["center"][0] - x) ** 2 + (item["center"][1] - y) ** 2 > 16
+                for x, y in fixed
+            )
+        ]}
+        for record in records
+    ]
+
+
 def _continuous_flatten_balls(
     records,
     min_conf=0.0,
@@ -827,7 +870,7 @@ def _valid_net_records(records):
 
 
 def find_candidate_crossings(records, rim, max_gap_sec=2.5, margin=16, dedupe_sec=0.8, min_descent_px=20):
-    balls = _flatten_balls(records)
+    balls = _flatten_balls(_without_stationary_balls(records))
     rim_y = rim["rim_y"]
     rim_width = max(1.0, float(rim["width"]))
     rim_left = rim["center_x"] - rim_width / 2

@@ -24,6 +24,7 @@ from .adapters.analysis import (
     candidate_to_row,
     flatten_coarse_matches,
     flatten_refined_matches,
+    focus_roi_on_net,
     PipelineCancelled,
     rim_check_inputs,
     run_pipeline,
@@ -37,6 +38,7 @@ from .adapters.export import (
     export_goal_clips,
     merge_existing_videos,
     merge_overlapping_candidates,
+    merge_duplicate_auto_candidates,
     normalize_output_path,
     safe_file_stem,
     trajectory_points,
@@ -1495,8 +1497,9 @@ class EngineService:
                     net_roi = [float(raw_net_roi[key]) for key in ("x1", "y1", "x2", "y2")]
                 except (KeyError, TypeError, ValueError):
                     net_roi = None
+            detection_roi = focus_roi_on_net(source_roi, net_roi)
             proxy_roi = scale_roi_to_proxy(
-                roi,
+                dict(zip(("x1", "y1", "x2", "y2"), detection_roi)),
                 source_width,
                 proxy_width,
                 source_height=source_height,
@@ -1511,6 +1514,7 @@ class EngineService:
                 "model_path": str(model_path),
                 "model_mtime_ns": model_path.stat().st_mtime_ns,
                 "roi": source_roi,
+                "detection_roi": detection_roi,
                 "net_roi": net_roi,
                 "proxy_width": proxy_width,
                 "proxy_height": proxy_height,
@@ -1565,7 +1569,7 @@ class EngineService:
                 coarse_candidates=coarse_candidates,
                 refined_output=refined_output,
                 proxy_roi=proxy_roi,
-                source_roi=source_roi,
+                source_roi=detection_roi,
                 cache_dir=cache_dir,
                 proxy_width=proxy_width,
                 proxy_height=proxy_height,
@@ -2457,7 +2461,11 @@ class EngineService:
         duration_ms = 0
         processing_ms = 0
         merged_overlap_count = 0
-        sizes = [len(merge_overlapping_candidates(group)) if effect == "none" else len(group) for group in groups.values()]
+        sizes = [
+            len(merge_overlapping_candidates(merge_duplicate_auto_candidates(group)))
+            if effect == "none" else len(merge_duplicate_auto_candidates(group))
+            for group in groups.values()
+        ]
         done = 0
         try:
             for index, (name, group) in enumerate(groups.items()):
@@ -2572,6 +2580,7 @@ class EngineService:
                 "player_name": candidate.get("player_name"),
                 "rim": EngineService._candidate_rim(store, candidate),
                 "manual": str(candidate.get("detector_version") or "").startswith("manual"),
+                "review_status": candidate.get("review_status"),
                 "trail": EngineService._candidate_trail(candidate),
             }
             for candidate in store.list_candidates(video_id)
