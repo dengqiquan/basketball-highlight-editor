@@ -310,3 +310,80 @@ def test_manual_missing_input_defaults_to_dry_run_through_every_gate(tmp_path):
         args = arglog.read_text().splitlines()
         assert ('--dry-run' in args) is not production
         assert ('--oss-config' in args) is production
+
+
+def test_macos_intel_constraints_are_scoped_to_intel_runtime(tmp_path):
+    workflow = yaml.safe_load((ROOT / '.github/workflows/release-packages.yml').read_text())
+    steps = workflow['jobs']['macos']['steps']
+    install = next(step for step in steps if step.get('name') == 'Install Python runtime dependencies')
+    script = install['run']
+    subprocess.run(['bash', '-n'], input=script, text=True, check=True)
+    fake_python = tmp_path / 'bin' / 'python3'
+    fake_python.parent.mkdir()
+    fake_python.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$BHE_TEST_PIP_LOG"\n')
+    fake_python.chmod(0o755)
+    for arch in ('x86_64', 'arm64'):
+        log = tmp_path / f'{arch}.log'
+        env = {**os.environ, 'ARCH': arch, 'PYTHON_ROOT': str(tmp_path), 'BHE_TEST_PIP_LOG': str(log)}
+        subprocess.run(['bash', '-c', script], env=env, check=True, capture_output=True, text=True)
+        commands = log.read_text().splitlines()
+        install_command = next(command for command in commands if '-r requirements.txt' in command)
+        assert ('-c requirements-macos-intel-constraints.txt' in install_command) == (arch == 'x86_64')
+        assert any(command == '-m pip check' for command in commands) == (arch == 'x86_64')
+
+
+def test_macos_release_tests_bundled_numpy_preprocessing():
+    workflow = yaml.safe_load((ROOT / '.github/workflows/release-packages.yml').read_text())
+    build = next(step for step in workflow['jobs']['macos']['steps'] if step.get('name') == 'Build macOS package')
+    script = build['run']
+    subprocess.run(['bash', '-n'], input=script, text=True, check=True)
+    assert 'BHE.app/Contents/Resources/runtime/python/bin/python3' in script
+    assert 'scripts/check_numpy_preprocess.py --python' in script
+    assert script.index('scripts/build_macos_release.sh') < script.index('scripts/check_numpy_preprocess.py')
+
+
+def test_native_intel_smoke_uses_release_constraints():
+    workflow = yaml.safe_load((ROOT / '.github/workflows/python-tests.yml').read_text())
+    assert workflow['permissions'] == {'contents': 'read'}
+    job = workflow['jobs']['macos-intel-runtime']
+    assert job['runs-on'] == 'macos-15-intel'
+    install = next(step['run'] for step in job['steps'] if step.get('name') == 'Install Intel runtime dependencies')
+    subprocess.run(['bash', '-n'], input=install, text=True, check=True)
+    assert '-c requirements-macos-intel-constraints.txt -r requirements.txt' in install
+    assert 'python -m pip check' in install
+    assert 'pytest' not in install
+    smoke = next(step for step in job['steps'] if step.get('name') == 'Check NumPy and preprocessing')
+    assert smoke['run'] == 'python scripts/check_numpy_preprocess.py'
+
+
+def test_manual_url_rewrite_is_explicit_and_skips_release_assets():
+    workflow = yaml.safe_load((ROOT / '.github/workflows/upload-release-assets-oss.yml').read_text())
+    choice = workflow[True]['workflow_dispatch']['inputs']['rewrite_urls']
+    assert choice['default'] == 'none' and choice['options'] == ['none', 'dl', 'oss']
+    job = workflow['jobs']['upload']
+    assert "'bhe-production-update-channel-v1'" in job['concurrency']['group']
+    download = next(step for step in job['steps'] if step.get('id') == 'download_release')
+    assert download['if'] == "${{ inputs.rewrite_urls == 'none' }}"
+    publish = next(step['run'] for step in job['steps'] if step.get('id') == 'publish')
+    subprocess.run(['bash', '-n'], input=publish, text=True, check=True)
+    assert '--rewrite-urls "$URL_REWRITE_MODE"' in publish
+
+
+def test_manual_workflow_passes_only_known_rewrite_options(tmp_path):
+    workflow = yaml.safe_load((ROOT / '.github/workflows/upload-release-assets-oss.yml').read_text())
+    script = next(step['run'] for step in workflow['jobs']['upload']['steps'] if step.get('id') == 'publish')
+    python = tmp_path / 'python3'
+    python.write_text('#!/bin/bash\nif [[ "$1" == -c ]]; then echo status=dry-run-ok; else printf "%s\\n" "$@" > "$ARG_LOG"; fi\n')
+    python.chmod(0o755)
+    for value in ('none', 'dl', 'oss', 'unknown'):
+        arglog = tmp_path / ('args-' + value)
+        env = dict(os.environ, PATH=str(tmp_path) + ':' + os.environ['PATH'], RUNNER_TEMP=str(tmp_path),
+                   UPDATE_SIGNING_KEY='fake', TAG_NAME='v0.1.13', RELEASE_PLATFORM='all', OSS_BUCKET='oss://fake',
+                   OSS_PREFIX='releases', OSS_ANDROID_KEY='android/latest.apk', DRY_RUN='true',
+                   URL_REWRITE_MODE=value, ARG_LOG=str(arglog), GITHUB_OUTPUT=str(tmp_path / 'output'))
+        result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], env=env, capture_output=True, text=True)
+        assert (result.returncode != 0) == (value == 'unknown')
+        if value != 'unknown':
+            args = arglog.read_text().splitlines()
+            assert ('--rewrite-urls' in args) == (value != 'none')
+            if value != 'none': assert args[args.index('--rewrite-urls') + 1] == value
