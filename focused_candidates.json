@@ -1,0 +1,1088 @@
+{
+  "video": "C:\\Users\\dengv\\Videos\\BasketballProjects\\b70103acc8c3cba916c08bee0a0d528e-1793234186599\\artifacts\\proxies\\video_f408b025cdee41a383275098527c4149_bd765cf0ac967217.mp4",
+  "model": "D:\\剪辑\\BHE-windows-x64-latest\\BHE\\runtime\\models\\bball_model.pt",
+  "rim": {
+    "center_x": 405.31,
+    "rim_y": 238.4,
+    "width": 21.48,
+    "height": 25.2,
+    "source": "median_hoop_detections",
+    "confidence_threshold": 0.08
+  },
+  "rim_mode": "windowed",
+  "candidates": [
+    {
+      "time": 8.1,
+      "x_cross": 401,
+      "above": {
+        "time": 7.0,
+        "x": 394.33,
+        "y": 223.11,
+        "confidence": 0.069,
+        "width": 11.339999999999975,
+        "height": 13.969999999999999
+      },
+      "below": {
+        "time": 9.2,
+        "x": 429.76,
+        "y": 308.72,
+        "confidence": 0.0926,
+        "width": 18.74000000000001,
+        "height": 19.71999999999997
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 18.6,
+      "x_cross": 400,
+      "above": {
+        "time": 17.8,
+        "x": 393.87,
+        "y": 225.04,
+        "confidence": 0.0865,
+        "width": 12.289999999999964,
+        "height": 15.79000000000002
+      },
+      "below": {
+        "time": 19.4,
+        "x": 415.67,
+        "y": 270.13,
+        "confidence": 0.0729,
+        "width": 21.44999999999999,
+        "height": 29.460000000000008
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 37.6,
+      "x_cross": 419,
+      "above": {
+        "time": 36.4,
+        "x": 394.18,
+        "y": 223.93,
+        "confidence": 0.0734,
+        "width": 12.069999999999993,
+        "height": 14.120000000000005
+      },
+      "below": {
+        "time": 38.8,
+        "x": 514.34,
+        "y": 293.11,
+        "confidence": 0.1205,
+        "width": 11.369999999999948,
+        "height": 24.829999999999984
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 43.4,
+      "x_cross": 393,
+      "above": {
+        "time": 42.6,
+        "x": 470.22,
+        "y": 201.62,
+        "confidence": 0.1789,
+        "width": 10.0,
+        "height": 11.70999999999998
+      },
+      "below": {
+        "time": 44.2,
+        "x": 346.96,
+        "y": 260.15,
+        "confidence": 0.3002,
+        "width": 15.230000000000018,
+        "height": 16.819999999999993
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 55.9,
+      "x_cross": 404,
+      "above": {
+        "time": 55.0,
+        "x": 423.81,
+        "y": 145.49,
+        "confidence": 0.1614,
+        "width": 12.169999999999959,
+        "height": 14.189999999999998
+      },
+      "below": {
+        "time": 56.8,
+        "x": 400.79,
+        "y": 255.56,
+        "confidence": 0.6856,
+        "width": 18.819999999999993,
+        "height": 21.07000000000002
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 68.3,
+      "x_cross": 411,
+      "above": {
+        "time": 67.4,
+        "x": 394.35,
+        "y": 223.9,
+        "confidence": 0.0972,
+        "width": 11.819999999999993,
+        "height": 13.590000000000003
+      },
+      "below": {
+        "time": 69.2,
+        "x": 448.77,
+        "y": 270.59,
+        "confidence": 0.0509,
+        "width": 15.360000000000014,
+        "height": 23.30000000000001
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 79.6,
+      "x_cross": 400,
+      "above": {
+        "time": 78.6,
+        "x": 394.46,
+        "y": 223.97,
+        "confidence": 0.0564,
+        "width": 12.510000000000048,
+        "height": 13.860000000000014
+      },
+      "below": {
+        "time": 80.6,
+        "x": 437.54,
+        "y": 345.28,
+        "confidence": 0.0519,
+        "width": 6.8799999999999955,
+        "height": 8.229999999999961
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 84.4,
+      "x_cross": 405,
+      "above": {
+        "time": 83.2,
+        "x": 456.23,
+        "y": 198.21,
+        "confidence": 0.6003,
+        "width": 10.71999999999997,
+        "height": 12.889999999999986
+      },
+      "below": {
+        "time": 85.6,
+        "x": 333.9,
+        "y": 294.89,
+        "confidence": 0.4179,
+        "width": 13.730000000000018,
+        "height": 22.230000000000018
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 91.8,
+      "x_cross": 408,
+      "above": {
+        "time": 90.6,
+        "x": 394.69,
+        "y": 223.98,
+        "confidence": 0.0574,
+        "width": 12.039999999999964,
+        "height": 13.549999999999983
+      },
+      "below": {
+        "time": 93.0,
+        "x": 517.31,
+        "y": 352.55,
+        "confidence": 0.0645,
+        "width": 5.25,
+        "height": 14.230000000000018
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 92.7,
+      "x_cross": 409,
+      "above": {
+        "time": 92.4,
+        "x": 394.73,
+        "y": 223.79,
+        "confidence": 0.1848,
+        "width": 11.389999999999986,
+        "height": 13.379999999999995
+      },
+      "below": {
+        "time": 93.0,
+        "x": 517.31,
+        "y": 352.55,
+        "confidence": 0.0645,
+        "width": 5.25,
+        "height": 14.230000000000018
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 94.8,
+      "x_cross": 400,
+      "above": {
+        "time": 94.0,
+        "x": 394.64,
+        "y": 223.76,
+        "confidence": 0.145,
+        "width": 11.810000000000002,
+        "height": 14.219999999999999
+      },
+      "below": {
+        "time": 95.6,
+        "x": 410.85,
+        "y": 268.97,
+        "confidence": 0.5963,
+        "width": 11.110000000000014,
+        "height": 12.20999999999998
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 96.5,
+      "x_cross": 400,
+      "above": {
+        "time": 95.8,
+        "x": 394.66,
+        "y": 223.06,
+        "confidence": 0.5204,
+        "width": 12.449999999999989,
+        "height": 14.560000000000002
+      },
+      "below": {
+        "time": 97.2,
+        "x": 419.07,
+        "y": 289.41,
+        "confidence": 0.3743,
+        "width": 14.649999999999977,
+        "height": 18.420000000000016
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 99.0,
+      "x_cross": 407,
+      "above": {
+        "time": 97.8,
+        "x": 394.44,
+        "y": 223.15,
+        "confidence": 0.3024,
+        "width": 11.379999999999995,
+        "height": 13.52000000000001
+      },
+      "below": {
+        "time": 100.2,
+        "x": 449.33,
+        "y": 289.88,
+        "confidence": 0.4377,
+        "width": 14.53000000000003,
+        "height": 16.139999999999986
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 99.9,
+      "x_cross": 407,
+      "above": {
+        "time": 99.6,
+        "x": 394.48,
+        "y": 222.96,
+        "confidence": 0.3689,
+        "width": 11.170000000000016,
+        "height": 13.609999999999985
+      },
+      "below": {
+        "time": 100.2,
+        "x": 449.33,
+        "y": 289.88,
+        "confidence": 0.4377,
+        "width": 14.53000000000003,
+        "height": 16.139999999999986
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 102.0,
+      "x_cross": 406,
+      "above": {
+        "time": 100.8,
+        "x": 394.19,
+        "y": 223.08,
+        "confidence": 0.1875,
+        "width": 11.759999999999991,
+        "height": 14.299999999999983
+      },
+      "below": {
+        "time": 103.2,
+        "x": 465.89,
+        "y": 314.95,
+        "confidence": 0.5324,
+        "width": 16.649999999999977,
+        "height": 29.19999999999999
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 102.9,
+      "x_cross": 406,
+      "above": {
+        "time": 102.6,
+        "x": 394.5,
+        "y": 223.17,
+        "confidence": 0.4518,
+        "width": 11.620000000000005,
+        "height": 14.469999999999999
+      },
+      "below": {
+        "time": 103.2,
+        "x": 465.89,
+        "y": 314.95,
+        "confidence": 0.5324,
+        "width": 16.649999999999977,
+        "height": 29.19999999999999
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 104.4,
+      "x_cross": 422,
+      "above": {
+        "time": 104.2,
+        "x": 394.67,
+        "y": 223.85,
+        "confidence": 0.1614,
+        "width": 11.379999999999995,
+        "height": 14.870000000000005
+      },
+      "below": {
+        "time": 104.6,
+        "x": 483.39,
+        "y": 270.31,
+        "confidence": 0.6724,
+        "width": 9.699999999999989,
+        "height": 11.669999999999959
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 113.4,
+      "x_cross": 401,
+      "above": {
+        "time": 112.2,
+        "x": 394.62,
+        "y": 223.27,
+        "confidence": 0.2051,
+        "width": 11.980000000000018,
+        "height": 14.400000000000006
+      },
+      "below": {
+        "time": 114.6,
+        "x": 413.11,
+        "y": 264.45,
+        "confidence": 0.8435,
+        "width": 14.180000000000007,
+        "height": 14.819999999999993
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 114.3,
+      "x_cross": 402,
+      "above": {
+        "time": 114.0,
+        "x": 394.64,
+        "y": 222.94,
+        "confidence": 0.3357,
+        "width": 11.050000000000011,
+        "height": 13.719999999999999
+      },
+      "below": {
+        "time": 114.6,
+        "x": 413.11,
+        "y": 264.45,
+        "confidence": 0.8435,
+        "width": 14.180000000000007,
+        "height": 14.819999999999993
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 120.4,
+      "x_cross": 399,
+      "above": {
+        "time": 120.0,
+        "x": 394.95,
+        "y": 223.24,
+        "confidence": 0.1063,
+        "width": 11.879999999999995,
+        "height": 14.25
+      },
+      "below": {
+        "time": 120.8,
+        "x": 411.35,
+        "y": 279.18,
+        "confidence": 0.7639,
+        "width": 18.910000000000025,
+        "height": 19.689999999999998
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 123.1,
+      "x_cross": 404,
+      "above": {
+        "time": 123.0,
+        "x": 394.73,
+        "y": 223.06,
+        "confidence": 0.1793,
+        "width": 11.610000000000014,
+        "height": 14.430000000000007
+      },
+      "below": {
+        "time": 123.2,
+        "x": 429.47,
+        "y": 281.78,
+        "confidence": 0.4852,
+        "width": 14.099999999999966,
+        "height": 18.579999999999984
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 123.9,
+      "x_cross": 401,
+      "above": {
+        "time": 123.8,
+        "x": 394.7,
+        "y": 222.89,
+        "confidence": 0.2439,
+        "width": 11.569999999999993,
+        "height": 13.700000000000017
+      },
+      "below": {
+        "time": 124.0,
+        "x": 421.21,
+        "y": 289.27,
+        "confidence": 0.5844,
+        "width": 11.45999999999998,
+        "height": 17.029999999999973
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 127.4,
+      "x_cross": 413,
+      "above": {
+        "time": 126.2,
+        "x": 394.58,
+        "y": 223.28,
+        "confidence": 0.2364,
+        "width": 11.430000000000007,
+        "height": 14.360000000000014
+      },
+      "below": {
+        "time": 128.6,
+        "x": 485.99,
+        "y": 299.82,
+        "confidence": 0.1626,
+        "width": 10.769999999999982,
+        "height": 10.269999999999982
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 128.3,
+      "x_cross": 413,
+      "above": {
+        "time": 128.0,
+        "x": 394.57,
+        "y": 222.89,
+        "confidence": 0.118,
+        "width": 11.819999999999993,
+        "height": 15.02000000000001
+      },
+      "below": {
+        "time": 128.6,
+        "x": 485.99,
+        "y": 299.82,
+        "confidence": 0.1626,
+        "width": 10.769999999999982,
+        "height": 10.269999999999982
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 133.6,
+      "x_cross": 404,
+      "above": {
+        "time": 132.4,
+        "x": 394.31,
+        "y": 222.75,
+        "confidence": 0.5598,
+        "width": 11.529999999999973,
+        "height": 13.519999999999982
+      },
+      "below": {
+        "time": 134.8,
+        "x": 407.62,
+        "y": 244.95,
+        "confidence": 0.4172,
+        "width": 12.310000000000002,
+        "height": 12.840000000000003
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 134.4,
+      "x_cross": 404,
+      "above": {
+        "time": 134.0,
+        "x": 394.12,
+        "y": 223.34,
+        "confidence": 0.23,
+        "width": 12.269999999999982,
+        "height": 14.199999999999989
+      },
+      "below": {
+        "time": 134.8,
+        "x": 407.62,
+        "y": 244.95,
+        "confidence": 0.4172,
+        "width": 12.310000000000002,
+        "height": 12.840000000000003
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 138.0,
+      "x_cross": 412,
+      "above": {
+        "time": 136.8,
+        "x": 393.97,
+        "y": 223.28,
+        "confidence": 0.3573,
+        "width": 12.21999999999997,
+        "height": 13.79000000000002
+      },
+      "below": {
+        "time": 139.2,
+        "x": 509.31,
+        "y": 317.72,
+        "confidence": 0.2531,
+        "width": 7.229999999999961,
+        "height": 13.29000000000002
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 146.0,
+      "x_cross": 402,
+      "above": {
+        "time": 145.0,
+        "x": 393.9,
+        "y": 223.2,
+        "confidence": 0.1176,
+        "width": 11.5,
+        "height": 13.780000000000001
+      },
+      "below": {
+        "time": 147.0,
+        "x": 420.97,
+        "y": 271.77,
+        "confidence": 0.0941,
+        "width": 15.099999999999966,
+        "height": 16.569999999999993
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 147.2,
+      "x_cross": 410,
+      "above": {
+        "time": 146.2,
+        "x": 460.26,
+        "y": 167.48,
+        "confidence": 0.0818,
+        "width": 10.350000000000023,
+        "height": 11.700000000000017
+      },
+      "below": {
+        "time": 148.2,
+        "x": 370.97,
+        "y": 292.42,
+        "confidence": 0.2746,
+        "width": 10.329999999999984,
+        "height": 14.729999999999961
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 172.4,
+      "x_cross": 404,
+      "above": {
+        "time": 172.0,
+        "x": 392.81,
+        "y": 223.05,
+        "confidence": 0.0522,
+        "width": 11.549999999999955,
+        "height": 14.439999999999998
+      },
+      "below": {
+        "time": 172.8,
+        "x": 449.5,
+        "y": 301.87,
+        "confidence": 0.0925,
+        "width": 20.370000000000005,
+        "height": 13.470000000000027
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 185.6,
+      "x_cross": 413,
+      "above": {
+        "time": 184.8,
+        "x": 393.37,
+        "y": 223.28,
+        "confidence": 0.088,
+        "width": 11.980000000000018,
+        "height": 14.04000000000002
+      },
+      "below": {
+        "time": 186.4,
+        "x": 450.01,
+        "y": 266.77,
+        "confidence": 0.7636,
+        "width": 13.129999999999995,
+        "height": 16.04000000000002
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 187.6,
+      "x_cross": 388,
+      "above": {
+        "time": 186.8,
+        "x": 393.39,
+        "y": 222.84,
+        "confidence": 0.0791,
+        "width": 13.160000000000025,
+        "height": 14.519999999999982
+      },
+      "below": {
+        "time": 188.4,
+        "x": 362.98,
+        "y": 307.78,
+        "confidence": 0.1638,
+        "width": 13.089999999999975,
+        "height": 23.680000000000007
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 194.6,
+      "x_cross": 407,
+      "above": {
+        "time": 193.4,
+        "x": 394.18,
+        "y": 223.28,
+        "confidence": 0.1267,
+        "width": 12.450000000000045,
+        "height": 13.800000000000011
+      },
+      "below": {
+        "time": 195.8,
+        "x": 452.71,
+        "y": 291.59,
+        "confidence": 0.2751,
+        "width": 7.989999999999952,
+        "height": 11.810000000000002
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 195.5,
+      "x_cross": 408,
+      "above": {
+        "time": 195.2,
+        "x": 394.53,
+        "y": 222.76,
+        "confidence": 0.0661,
+        "width": 11.119999999999948,
+        "height": 12.77000000000001
+      },
+      "below": {
+        "time": 195.8,
+        "x": 452.71,
+        "y": 291.59,
+        "confidence": 0.2751,
+        "width": 7.989999999999952,
+        "height": 11.810000000000002
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 196.9,
+      "x_cross": 408,
+      "above": {
+        "time": 196.0,
+        "x": 394.29,
+        "y": 223.35,
+        "confidence": 0.1674,
+        "width": 11.910000000000025,
+        "height": 13.620000000000005
+      },
+      "below": {
+        "time": 197.8,
+        "x": 455.33,
+        "y": 290.78,
+        "confidence": 0.0884,
+        "width": 10.920000000000016,
+        "height": 13.050000000000011
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 216.7,
+      "x_cross": 393,
+      "above": {
+        "time": 216.0,
+        "x": 395.0,
+        "y": 223.12,
+        "confidence": 0.0908,
+        "width": 12.360000000000014,
+        "height": 14.990000000000009
+      },
+      "below": {
+        "time": 217.4,
+        "x": 387.59,
+        "y": 269.77,
+        "confidence": 0.1095,
+        "width": 11.229999999999961,
+        "height": 12.45999999999998
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    },
+    {
+      "time": 249.1,
+      "x_cross": 412,
+      "above": {
+        "time": 248.2,
+        "x": 404.87,
+        "y": 224.41,
+        "confidence": 0.0592,
+        "width": 12.009999999999991,
+        "height": 12.439999999999998
+      },
+      "below": {
+        "time": 250.0,
+        "x": 451.06,
+        "y": 319.78,
+        "confidence": 0.0617,
+        "width": 6.740000000000009,
+        "height": 11.660000000000025
+      },
+      "rim": {
+        "center_x": 405.31,
+        "rim_y": 238.4,
+        "width": 21.48,
+        "height": 25.2,
+        "source": "median_hoop_detections",
+        "confidence_threshold": 0.08
+      },
+      "rim_source": "global"
+    }
+  ]
+}

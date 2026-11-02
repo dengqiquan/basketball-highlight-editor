@@ -1,0 +1,39 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>篮球进球集锦编辑器：详细设计与一级核心算法</title><style>
+@page{size:A4;margin:18mm 17mm 17mm}*{box-sizing:border-box}body{font-family:'Microsoft YaHei','SimHei',sans-serif;color:#192638;font-size:10.5pt;line-height:1.65;margin:0}h1{font-size:23pt;line-height:1.3;color:#11233b;margin:0 0 6mm}h2{font-size:15pt;color:#12385c;margin:9mm 0 3mm;border-bottom:2px solid #d9e6ee;padding-bottom:1.5mm;break-after:avoid}h3{font-size:11.5pt;color:#17476b;margin:5mm 0 2mm;break-after:avoid}p{margin:2mm 0 3mm}ul{margin:1mm 0 3mm;padding-left:6mm}li{margin:1mm 0}.lead{font-size:12pt;color:#39536a}.meta{color:#61758b;font-size:9pt;margin-bottom:8mm}.box{background:#eff6fa;border-left:4px solid #2e779c;padding:3mm 4mm;margin:4mm 0}.flow{font-weight:bold;text-align:center;color:#17476b;background:#f3f7fa;padding:4mm 3mm;border-radius:3mm;line-height:2}.small{font-size:8.5pt;color:#607286}.code{font-family:Consolas,monospace;background:#f3f7fa;padding:3mm;white-space:pre-wrap;font-size:9pt;line-height:1.5}table{border-collapse:collapse;width:100%;font-size:9pt;margin:3mm 0 4mm;break-inside:avoid}th,td{border:1px solid #cddbe5;padding:2mm 2.5mm;vertical-align:top}th{background:#eaf2f7;color:#163d5d;text-align:left}tr{break-inside:avoid}.section{break-inside:avoid}.refs{font-size:8.5pt;color:#52677b;overflow-wrap:anywhere}.footer{border-top:1px solid #cddbe5;margin-top:10mm;padding-top:2mm;color:#789;font-size:8pt}
+</style></head><body>
+<h1>篮球进球集锦编辑器<br>详细设计与一级核心算法逻辑</h1>
+<div class="meta">Basketball Highlight Editor · 基于当前仓库实现整理 · 2026-10-31</div>
+<p class="lead">项目以本地视频为输入，自动找出疑似进球片段，由用户审核、调整范围，并从原视频导出集锦。</p>
+<div class="flow">导入视频 → 设置篮筐 ROI → 代理粗扫 → 原视频精筛 → 证据判决 → 人工审核 → 导出</div>
+<h2>1. 总体架构与职责</h2>
+<table><tr><th>层次</th><th>职责</th><th>主要实现</th></tr><tr><td>Flutter 界面</td><td>项目、视频、ROI、任务进度、候选审核、片段调整和导出操作。</td><td>apps/desktop/lib；apps/mobile/lib</td></tr><tr><td>桌面 Engine</td><td>JSON Lines 协议、任务生命周期、算法调度、缓存、持久化。</td><td>engine/python/basketball_engine</td></tr><tr><td>分析算法</td><td>抽帧检测、篮筐估计、球轨迹、穿框、篮网信号和判决。</td><td>scripts；src/basketball_highlight</td></tr><tr><td>数据与媒体</td><td>SQLite 保存业务状态；FFmpeg 生成代理与导出 MP4；中间产物可重建。</td><td>storage.py；adapters/export.py</td></tr><tr><td>移动 Runtime</td><td>原生抽帧、Rust/ONNX 推理和候选生成。</td><td>packages/bhe_runtime/src/lib.rs</td></tr></table>
+<p>原始视频用于精确导出，代理视频用于低成本扫描。数据库保存项目、候选、审核和任务事实状态；视频及检测缓存不放进 SQLite。桌面 UI 不直接执行检测模型或修改数据库。</p>
+<h2>2. 数据对象和任务状态</h2>
+<table><tr><th>对象</th><th>关键内容</th></tr><tr><td>Project / Video</td><td>项目配置、原视频路径和媒体元数据。</td></tr><tr><td>ROI</td><td>篮筐分析区域及可选篮网区域、校准信息。</td></tr><tr><td>Job</td><td>分析或导出任务的阶段、进度、错误和 checkpoint。</td></tr><tr><td>Candidate</td><td>事件时间、默认及人工片段范围、分数、证据 JSON。</td></tr><tr><td>Review / Export</td><td>人工保留或排除状态、标签，以及最终导出记录。</td></tr></table>
+<p>任务通常经过 queued → running → completed；运行中可进入 cancelling/cancelled 或 failed。分析阶段产物和参数快照支持复用与恢复。重新分析成功后才切换候选结果；失败或取消保留旧结果。</p>
+<h2>3. 一级核心算法：桌面标准分析链</h2>
+<h3>3.1 生成代理并粗扫</h3>
+<p>Engine 为指定分析范围生成低帧率代理视频，在用户设置的 ROI 内按固定时间采样。检测器识别球与篮筐，输出每个采样点的类别、置信度、边界框和球心。标准模式代理目标框默认 960×720、5 FPS；实际尺寸保持原视频宽高比。模型输入为 640×640，裁切放大倍率受输入尺寸约束。</p>
+<h3>3.2 估计篮筐并提出粗候选</h3>
+<p>篮筐检测框的中心和尺寸采用中位数估计；对移动机位，按时间窗口估计局部篮筐。若球先在筐线上方、随后在下方，下降幅度足够，且轨迹与筐线的交点落在筐口允许范围内，就提出疑似穿框候选。粗扫重在召回，不能单独证明进球。</p>
+<div class="code">r = (rim_y - y_above) / (y_below - y_above)
+x_cross = x_above + r × (x_below - x_above)
+event_time = t_above + r × (t_below - t_above)</div>
+<h3>3.3 回源精筛与轨迹关联</h3>
+<p>标准模式围绕每个粗候选的时间点回到原视频，默认在前后各 2.5 秒窗口内以 10 FPS 采样。它重新检测球和篮筐、构建多条球轨迹，并恢复短暂遮挡导致的断轨。局部篮筐位置还会根据窗口内的稳定检测重新校准。</p>
+<p>精筛要求球从篮筐上方进入筐口走廊、穿过筐线，在筐下形成连续实测点；仅凭两个点插值穿过筐线，不算完整穿框。中间轨迹明显偏离、横向运动过强或下降速度异常的候选会被过滤。对球短暂遮挡的情形，下降轨迹拟合可提供人工复核证据。</p>
+<h3>3.4 汇总证据并判决</h3>
+<table><tr><th>证据</th><th>判定用途</th></tr><tr><td>完整穿框与筐下持续性</td><td>确认球真实穿过筐口并继续向下。</td></tr><tr><td>篮网区域变化</td><td>比较篮网上、中、下区域的图像变化和激活顺序；单独记录测量是否有效。</td></tr><tr><td>反弹与侧向离开</td><td>识别近筐回升、从篮筐旁离开的反证据；深处落地反弹不作为撞框反弹。</td></tr><tr><td>几何与校准门槛</td><td>综合球速、横向跨度和篮网信号，决定高精度与自动导出资格。</td></tr></table>
+<p>判决为 made、missed 或 ambiguous：强反证据判 missed；完整穿框、筐下持续性及相应正向证据满足门槛时判 made；不足以确认的保留 ambiguous 供人工审核。made 和 auto_export_eligible 是不同字段。</p>
+<h3>3.5 篮筐局部复核、去重与入库</h3>
+<p>Engine 对最终候选在篮筐附近逐帧复核，更新候选证据。相近时间的候选通常按 2 秒窗口归并，综合 verdict、完整穿框、证据来源和分数选代表事件。候选入库包含事件时间、默认片段范围、分数、检测版本和完整证据 JSON。</p>
+<h2>4. 快速模式与移动端</h2>
+<p><b>快速模式：</b>代理目标框为 640×480、3 FPS，跳过原视频精筛，粗扫结果直接进入审核并标记 coarse 来源。它速度更快，但可能漏检，证据强度也低于标准模式。</p>
+<p><b>移动端：</b>Flutter 应用独立运行，通过平台媒体层抽帧，由 Rust/ONNX Runtime 检测与判决。跨端契约统一事件时间、完整穿框、篮网可用性、反弹、侧向离开、verdict 和自动导出资格。两端抽帧与模型执行仍不同，真实视频结果一致性需要回放验收。</p>
+<h2>5. 人工审核与导出</h2>
+<p>用户可保留或排除候选、调整片段起止点和标签。导出使用审核后的时间范围，从原视频编码片段；合并模式先处理重叠片段，再拼接，直接拼接失败时回退到重新编码。分析结果服务于审核，最终输出由人工选择状态和片段范围控制。</p>
+<div class="box"><b>核心逻辑概括：</b>低成本粗扫找可能事件；原视频精筛验证球的真实运动；结合篮网变化和反证据给出保守判决；不确定事件交由人工审核；按审核结果从原视频导出。</div>
+<h2>6. 主要源码定位</h2>
+<div class="refs">架构：docs/architecture/ARCHITECTURE_V1.md；跨端契约：docs/architecture/CROSS_PLATFORM_ANALYSIS_CONTRACT_V1.md；流水线：engine/python/basketball_engine/adapters/analysis.py；任务编排：engine/python/basketball_engine/service.py；粗扫：scripts/scan_video.py、scripts/generate_candidates.py；精筛：scripts/refine_dynamic_candidates.py、src/basketball_highlight/events.py；判决：src/basketball_highlight/verdict.py；篮筐复核：src/basketball_highlight/rim_check.py；导出：engine/python/basketball_engine/adapters/export.py；移动端：packages/bhe_runtime/src/lib.rs。</div>
+<div class="footer">本文依据当前仓库代码与设计文档整理；参数为代码默认值，具体运行可受模式与任务配置影响。</div>
+</body></html>
