@@ -119,6 +119,7 @@ class EngineClient implements EngineTransport {
       throw const EngineException('ENGINE_NOT_RUNNING', 'Engine 尚未启动');
     }
     final requestId = 'dart-${++_requestSequence}';
+    final startedAt = Stopwatch()..start();
     final completer = Completer<Map<String, dynamic>>();
     _pending[requestId] = completer;
     try {
@@ -139,17 +140,20 @@ class EngineClient implements EngineTransport {
       _timeoutFor(command),
       onTimeout: () {
         _pending.remove(requestId);
-        log('$command timed out');
+        log('$command timed out after ${startedAt.elapsedMilliseconds}ms');
         throw EngineException('ENGINE_TIMEOUT', '请求处理超时：$command');
       },
     );
     if (response['ok'] != true) {
       final error = response['error'];
-      log('$command failed: ${jsonEncode(error)}');
+      log('$command failed after ${startedAt.elapsedMilliseconds}ms: ${jsonEncode(error)}');
       if (error is Map) {
         throw EngineException('${error['code']}', '${error['message']}');
       }
       throw const EngineException('ENGINE_ERROR', 'Engine 返回未知错误');
+    }
+    if (startedAt.elapsedMilliseconds >= 3000) {
+      log('$command slow: ${startedAt.elapsedMilliseconds}ms');
     }
     final payloadValue = response['payload'];
     return payloadValue is Map<String, dynamic>
@@ -172,7 +176,8 @@ class EngineClient implements EngineTransport {
         try {
           await process.stdin.close().timeout(const Duration(seconds: 6));
           await process.exitCode.timeout(const Duration(seconds: 6));
-        } on Object {
+        } on Object catch (error) {
+          appLog('warn', 'engine_client', '_dispose 忽略了错误: $error');
           process.kill();
           // Returning before exit would let the updater race locked DLLs.
           await process.exitCode.timeout(const Duration(seconds: 6));

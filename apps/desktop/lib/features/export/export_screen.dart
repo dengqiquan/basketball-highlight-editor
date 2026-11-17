@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -11,6 +12,11 @@ import '../../components/cs_button.dart';
 import '../../components/cs_card.dart';
 import '../../components/cs_empty_state.dart';
 import '../../components/cs_progress_track.dart';
+import '../../components/onboarding_guide.dart';
+import '../../components/recover_save_window_button.dart';
+import '../../providers/onboarding_provider.dart';
+import '../../core/app_log.dart';
+import '../../core/windows_shell_reveal.dart';
 import '../../providers/project_state.dart';
 import '../../providers/playback_coordinator.dart';
 import '../../providers/export_output_picker.dart';
@@ -18,6 +24,9 @@ import '../../theme/app_colors.dart';
 import '../../theme/tokens.dart';
 import 'game_stats.dart';
 import 'standalone_video_merge_dialog.dart';
+
+@visibleForTesting
+final exportDialogLogProvider = Provider<void Function(String, String, String)>((ref) => appLog);
 
 /// Export 屏:汇总当前保留片段 + 合并/分别导出 CTA + 历史。
 ///
@@ -37,6 +46,9 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
   (String?, String?)? _playerFilterScope;
   bool _showFastRisk = true;
   bool _choosingOutput = false;
+  final _guideModeKey = GlobalKey();
+  final _guideTagModeKey = GlobalKey();
+  final _guideStartKey = GlobalKey();
   String _mode = 'merge';
   String? _referencePlayerId;
   String _effect = 'none';
@@ -58,10 +70,31 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
   }
 
   void _setEffect(String value) {
+    appLog('info', 'export', '选择效果 $value');
     setState(() => _effect = value);
     SharedPreferences.getInstance().then(
       (prefs) => prefs.setString(_effectKey, value),
     );
+  }
+
+  void _selectMode(String mode) {
+    if (_mode != mode) appLog('info', 'export', '选择输出方式 $mode');
+    setState(() => _mode = mode);
+  }
+
+  Future<void> _confirmUncertainExport(ProjectNotifier notifier) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(context.bheText('允许再次导出？')),
+        content: Text(context.bheText('请先检查导出任务和已生成的文件。上一次导出可能仍在运行或已经完成。')),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: Text(context.bheText('取消'))),
+          TextButton(onPressed: () => Navigator.pop(dialogContext, true), child: Text(context.bheText('已检查，允许再次导出'))),
+        ],
+      ),
+    );
+    if (confirmed == true && mounted) notifier.confirmUncertainExportChecked();
   }
 
   @override
@@ -191,29 +224,47 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
                     selected: _selectedPlayerIds.contains(
                       state.players[index]['id']?.toString(),
                     ),
-                    onSelected: (value) => setState(() {
+                    onSelected: (value) {
                       final id = state.players[index]['id']?.toString();
-                      if (id == null) return;
-                      if (!_playerFilterActive) {
-                        _includeUnassigned = false;
-                      }
-                      _playerFilterActive = true;
-                      if (value) {
-                        _selectedPlayerIds.add(id);
-                      } else {
-                        _selectedPlayerIds.remove(id);
-                      }
-                    }),
+                      setState(() {
+                        if (id == null) return;
+                        if (!_playerFilterActive) {
+                          _includeUnassigned = false;
+                        }
+                        _playerFilterActive = true;
+                        if (value) {
+                          _selectedPlayerIds.add(id);
+                        } else {
+                          _selectedPlayerIds.remove(id);
+                        }
+                      });
+                      appLogThrottled(
+                        'export-player-filter',
+                        'info',
+                        'export',
+                        '球员过滤变化 选中=${_selectedPlayerIds.length} '
+                            '含未标记=$_includeUnassigned',
+                      );
+                    },
                   ),
                 _ScopeChip(
                   label: l10n?.unassigned ?? '未标记',
                   count: _playerCount(state, null),
                   dashed: true,
                   selected: _playerFilterActive && _includeUnassigned,
-                  onSelected: (value) => setState(() {
-                    _playerFilterActive = true;
-                    _includeUnassigned = value;
-                  }),
+                  onSelected: (value) {
+                    setState(() {
+                      _playerFilterActive = true;
+                      _includeUnassigned = value;
+                    });
+                    appLogThrottled(
+                      'export-player-filter',
+                      'info',
+                      'export',
+                      '球员过滤变化 选中=${_selectedPlayerIds.length} '
+                          '含未标记=$_includeUnassigned',
+                    );
+                  },
                 ),
               ],
             ),
@@ -225,7 +276,9 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
           style: theme.textTheme.titleSmall,
         ),
         const SizedBox(height: Spacing.sm),
-        Row(
+        KeyedSubtree(
+          key: _guideModeKey,
+          child: Row(
           children: [
             Expanded(
               child: _ModeCard(
@@ -234,7 +287,7 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
                 description:
                     l10n?.exportMergeDescription ?? '按时间顺序拼接为一个 MP4，适合直接分享。',
                 selected: mode == 'merge',
-                onTap: () => setState(() => _mode = 'merge'),
+                onTap: () => _selectMode('merge'),
               ),
             ),
             const SizedBox(width: Spacing.sm),
@@ -246,20 +299,23 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
                     l10n?.exportSeparateDescription ??
                     '每段一个文件，放进同一个文件夹，适合二次剪辑。',
                 selected: mode == 'separate',
-                onTap: () => setState(() => _mode = 'separate'),
+                onTap: () => _selectMode('separate'),
               ),
             ),
             if (state.players.isNotEmpty) ...[
               const SizedBox(width: Spacing.sm),
               Expanded(
-                child: _ModeCard(
+                child: KeyedSubtree(
+                  key: _guideTagModeKey,
+                  child: _ModeCard(
                   key: const Key('export-mode-by-player'),
                   title: context.bheText('每个标签各合成一个视频'),
                   description: context.bheText(
                     '只导出选中的标签，每个标签一个 MP4，文件名就是标签名，放进同一个文件夹。',
                   ),
                   selected: mode == 'merge_by_player',
-                  onTap: () => setState(() => _mode = 'merge_by_player'),
+                  onTap: () => _selectMode('merge_by_player'),
+                ),
                 ),
               ),
               const SizedBox(width: Spacing.sm),
@@ -276,6 +332,7 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
               ),
             ],
           ],
+        ),
         ),
         if (mode == 'merge_balanced') ...[
           const SizedBox(height: Spacing.md),
@@ -395,9 +452,32 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
               label: Text(l10n?.text('重试导出') ?? '重试导出'),
               icon: LucideIcons.refreshCw,
               size: CsButtonSize.sm,
-              onPressed: busy ? null : () => notifier.retryExport(),
+              onPressed: busy
+                  ? null
+                  : () {
+                      appLog('info', 'export', '导出历史 重新导出');
+                      notifier.retryExport();
+                    },
             ),
           ),
+        ],
+        if (state.exportStartUnconfirmed) ...[
+          const SizedBox(height: Spacing.sm),
+          _ExportNotice(
+            color: c.warning,
+            text: context.bheText('上一次导出启动结果未确认，请先查看导出任务'),
+          ),
+          Wrap(spacing: Spacing.sm, children: [
+            TextButton(
+              key: const Key('export-check-unknown'),
+              onPressed: state.busy ? null : notifier.checkUnconfirmedExport,
+              child: Text(context.bheText('查看导出任务')),
+            ),
+            TextButton(
+              onPressed: state.busy ? null : () => _confirmUncertainExport(notifier),
+              child: Text(context.bheText('已检查，允许再次导出')),
+            ),
+          ]),
         ],
         const SizedBox(height: Spacing.lg),
         Wrap(
@@ -405,7 +485,9 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
           runSpacing: Spacing.sm,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
-            CsButton(
+            KeyedSubtree(
+              key: _guideStartKey,
+              child: CsButton(
               key: const Key('export-start'),
               label: Text(
                 l10n?.exportStartButton(includedCount) ??
@@ -414,15 +496,16 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
               icon: LucideIcons.download,
               size: CsButtonSize.lg,
               isLoading: busy,
-              onPressed: includedCount > 0 && !busy
+              onPressed: includedCount > 0 && !busy && !state.exportStartUnconfirmed
                   ? () => _chooseOutput(notifier, mode: mode)
                   : null,
+            ),
             ),
             ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 300),
               child: Text(
                 _choosingOutput
-                    ? context.bheText('正在准备输出位置…')
+                    ? context.bheText('请在弹出的窗口中选择保存位置')
                     : exportRunning
                     ? l10n?.text('导出任务在后台运行，返回审核后仍可继续修改候选。') ??
                           '导出任务在后台运行，返回审核后仍可继续修改候选。'
@@ -432,6 +515,8 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
                 ),
               ),
             ),
+            if (_choosingOutput && Platform.isMacOS)
+              RecoverSaveWindowButton(visible: _choosingOutput),
           ],
         ),
         if (state.candidates.isNotEmpty) ...[
@@ -491,7 +576,30 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
       ],
     );
 
-    return LayoutBuilder(
+    return OnboardingGuide(
+      page: onboardingExportPage,
+      ready: includedCount > 0 && !state.hydrating,
+      steps: [
+        OnboardingStep(
+          id: 'export.mode',
+          title: '先选输出方式',
+          body: '合并成一个视频，或每个片段单独导出；有球员标签时还能按标签各出一个。',
+          target: _guideModeKey,
+        ),
+        OnboardingStep(
+          id: 'export.tag',
+          title: '按球员标签各出一个视频',
+          body: '给候选打过球员标签后，这里会多出「每个标签各合成一个视频」：每个标签一个 MP4，文件名就是标签名。',
+          target: _guideTagModeKey,
+        ),
+        OnboardingStep(
+          id: 'export.start',
+          title: '点这里导出',
+          body: '接着选保存位置，已排除的片段不会进入输出。导出在后台进行，期间可以回审核继续看；原视频不会被修改。',
+          target: _guideStartKey,
+        ),
+      ],
+      child: LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 1000;
         return SingleChildScrollView(
@@ -520,6 +628,7 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
           ),
         );
       },
+    ),
     );
   }
 
@@ -570,21 +679,36 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
     final merge = mode == 'merge' || mode == 'merge_balanced';
     if (_choosingOutput) return;
     setState(() => _choosingOutput = true);
-    final videoId = ref.read(projectProvider).video?['id'];
-    final playerIds = _playerFilterActive ? _selectedPlayerIds.toList() : null;
-    final includeUnassigned = _playerFilterActive ? _includeUnassigned : null;
+    final chooseWatch = Stopwatch()..start();
     try {
+      void log(String level, String message) {
+        try {
+          ref.read(exportDialogLogProvider)(level, 'export', message);
+        } catch (_) {
+          // Diagnostics are best effort and must not block the picker.
+        }
+      }
+      log('info', '选择输出位置开始 mode=$mode');
+      final videoId = ref.read(projectProvider).video?['id'];
+      final playerIds = _playerFilterActive ? _selectedPlayerIds.toList() : null;
+      final includeUnassigned = _playerFilterActive ? _includeUnassigned : null;
       final picker = ref.read(exportOutputPickerProvider);
       final path = await ref
           .read(playbackCoordinatorProvider)
-          .withPausedPlayback(() async {
-            // Let the paused, offstage previews finish their last Flutter frame
-            // before Windows enters the native modal message loop.
-            await WidgetsBinding.instance.endOfFrame;
+          .withNativeDialog(() async {
             if (!mounted || !TickerMode.valuesOf(context).enabled) return null;
             return merge
-                ? picker.mergedPath(typeLabel: context.bheText('视频'))
+                ? picker.mergedPath(
+                    typeLabel: context.bheText('视频'),
+                    projectName: ref.read(projectProvider).statistics?['project']?['name']?.toString() ?? 'Project',
+                  )
                 : picker.directory(confirmLabel: context.bheText('选择输出目录'));
+          }, onPrepareTimeout: () {
+            log('warn', '准备阶段超过时限，直接弹出选择框');
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text(context.bheText('视频画面准备较慢，已直接打开选择窗口'))),
+            );
           });
       if (!mounted ||
           path == null ||
@@ -601,6 +725,9 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
         referencePlayerId: mode == 'merge_balanced' ? _referencePlayerId : null,
       );
     } catch (error) {
+      try {
+        ref.read(exportDialogLogProvider)('error', 'export', '选择输出位置失败: $error');
+      } catch (_) {}
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(context.bheText('选择输出位置失败：$error'))),
@@ -608,6 +735,9 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
       }
     } finally {
       if (mounted) setState(() => _choosingOutput = false);
+      try {
+        ref.read(exportDialogLogProvider)('info', 'export', '选择输出位置结束 耗时${chooseWatch.elapsedMilliseconds}ms');
+      } catch (_) {}
     }
   }
 }
@@ -1058,14 +1188,49 @@ class _ExportNotice extends StatelessWidget {
   }
 }
 
-class _RunningExportCard extends StatelessWidget {
+class _RunningExportCard extends StatefulWidget {
   const _RunningExportCard({required this.job, required this.onCancel});
 
   final Map<String, dynamic>? job;
   final VoidCallback? onCancel;
 
   @override
+  State<_RunningExportCard> createState() => _RunningExportCardState();
+}
+
+class _RunningExportCardState extends State<_RunningExportCard> {
+  late DateTime _started;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _started = DateTime.tryParse(widget.job?['started_at']?.toString() ?? '') ?? DateTime.now();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void didUpdateWidget(_RunningExportCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.job?['id'] != widget.job?['id']) {
+      _started = DateTime.tryParse(widget.job?['started_at']?.toString() ?? '') ?? DateTime.now();
+    } else {
+      _started = DateTime.tryParse(widget.job?['started_at']?.toString() ?? '') ?? _started;
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final job = widget.job;
+    final onCancel = widget.onCancel;
     final c = AppColors.of(context);
     final theme = Theme.of(context);
     final l10n = Localizations.of<BheLocalizations>(context, BheLocalizations);
@@ -1073,7 +1238,10 @@ class _RunningExportCard extends StatelessWidget {
       0.0,
       1.0,
     );
-    final stage = _exportStageLabel(job?['stage']?.toString() ?? '');
+    final stageKey = job?['stage']?.toString() ?? '';
+    final stage = _exportStageLabel(stageKey);
+    final verifying = stageKey == 'validate_source' || stageKey == 'verify_source' || stageKey == 'cancelling';
+    final elapsed = _formatMs(DateTime.now().difference(_started).inMilliseconds.clamp(0, 1 << 40));
     return Container(
       key: const Key('export-running'),
       padding: const EdgeInsets.all(Spacing.md),
@@ -1099,7 +1267,7 @@ class _RunningExportCard extends StatelessWidget {
               Expanded(
                 child: Text(
                   '${l10n?.exportRunningTitle ?? '正在导出'} · '
-                  '${l10n?.text(stage) ?? stage} · ${(progress * 100).round()}%',
+                  '${l10n?.text(stage) ?? stage}${verifying ? '' : ' · ${(progress * 100).round()}%'}',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: theme.textTheme.titleSmall?.copyWith(
@@ -1117,7 +1285,8 @@ class _RunningExportCard extends StatelessWidget {
             ],
           ),
           const SizedBox(height: Spacing.sm),
-          CsProgressTrack(value: progress),
+          CsProgressTrack(value: progress, indeterminate: verifying),
+          if (verifying) Text(context.bheText('已用 $elapsed'), key: const Key('export-elapsed')),
           const SizedBox(height: Spacing.sm),
           Text(
             l10n?.text('本次输出使用启动导出时的片段列表，之后的审核修改用于下一次导出。') ??
@@ -1152,6 +1321,10 @@ class _ExportHistoryCard extends StatelessWidget {
         ((item['metadata'] as Map?)?['merged_overlap_count'] as num?)
             ?.toInt() ??
         0;
+        ((item['metadata'] as Map?)?['merged_overlap_count'] as num?)?.toInt() ?? 0;
+    final colorWarnings = ((item['metadata'] as Map?)?['color_warnings'] as List?)
+            ?.whereType<String>().toList() ??
+        const <String>[];
     final processing = (item['processing_ms'] as num?)?.toInt() ?? 0;
     final fileSize = (item['file_size_bytes'] as num?)?.toInt() ?? 0;
     final width = (item['width'] as num?)?.toInt();
@@ -1227,6 +1400,20 @@ class _ExportHistoryCard extends StatelessWidget {
                     style: theme.textTheme.labelSmall?.copyWith(
                       color: c.textSecondary,
                     ),
+                  ),
+                if (((item['metadata'] as Map?)?['source_unverified']) == true)
+                  Text(context.bheText('原项目没有视频指纹，无法比对原视频内容。'),
+                      key: const Key('export-source-unverified'),
+                      style: theme.textTheme.labelSmall?.copyWith(color: c.warning)),
+                for (final warning in colorWarnings)
+                  Text(
+                    l10n?.localeName.startsWith('en') == true
+                        ? (warning == 'HDR 色调映射不可用，画面可能偏亮'
+                            ? 'HDR tone mapping is unavailable; the video may look too bright.'
+                            : 'Video color information is incomplete; HDR tone mapping was not applied.')
+                        : warning,
+                    key: const Key('export-color-warning'),
+                    style: theme.textTheme.labelSmall?.copyWith(color: c.warning),
                   ),
                 const SizedBox(height: 2),
                 SelectableText(
@@ -1304,21 +1491,22 @@ Future<void> _openDirectory(
 }) async {
   final l10n = Localizations.of<BheLocalizations>(context, BheLocalizations);
   try {
-    final String? target = targetPath == null || !File(targetPath).existsSync()
-        ? null
-        : targetPath;
     if (Platform.isMacOS) {
+      final String? target = targetPath == null || !File(targetPath).existsSync()
+          ? null
+          : targetPath;
       await Process.start(
         'open',
         target == null ? <String>[directory] : <String>['-R', target],
         mode: ProcessStartMode.detached,
       );
     } else if (Platform.isWindows) {
-      await Process.start(
-        'explorer.exe',
-        target == null ? <String>[directory] : <String>['/select,$target'],
-        mode: ProcessStartMode.detached,
-      );
+      // 不在界面线程做任何存在性检查:NAS 掉线时 File(...).existsSync()
+      // 会同步阻塞到网络超时,界面会冻住。targetPath 原样交给后台
+      // isolate,由 windows_shell_reveal.dart 在 isolate 内判断,文件
+      // 不存在时仅打开目录;正斜杠路径在内部归一化为反斜杠;失败时抛
+      // 异常走统一提示。
+      await openInWindowsExplorer(directory: directory, select: targetPath);
     } else if (Platform.isLinux) {
       await Process.start('xdg-open', <String>[
         directory,
@@ -1367,7 +1555,11 @@ class _EffectChoice {
 }
 
 List<_EffectChoice> _effectOptions(BuildContext context) => [
-  _EffectChoice('none', context.bheText('不加效果'), context.bheText('每个片段原样导出。')),
+  _EffectChoice(
+    'none',
+    context.bheText('不加效果'),
+    context.bheText('每个片段原样导出。'),
+  ),
   _EffectChoice(
     'approach',
     context.bheText('临门慢动作'),
@@ -1376,9 +1568,7 @@ List<_EffectChoice> _effectOptions(BuildContext context) => [
   _EffectChoice(
     'replay',
     context.bheText('慢放特写回放'),
-    context.bheText(
-      '片段播完后，重播入框前后约 0.8 秒的画面：放慢一倍，取景框住篮筐和球的飞行路线，方便看清球进没进。每个进球多约 1.6 秒。',
-    ),
+    context.bheText('片段播完后，重播入框前后约 0.8 秒的画面：放慢一倍，取景框住篮筐和球的飞行路线，方便看清球进没进。每个进球多约 1.6 秒。'),
   ),
 ];
 
@@ -1386,8 +1576,7 @@ List<_EffectChoice> _effectOptions(BuildContext context) => [
 int _effectDuration(int total, Map<String, dynamic> item, String effect) {
   if (effect == 'none') return _clipDuration(total, item);
   final base = _clipDuration(total, item);
-  if (item['detector_version']?.toString().startsWith('manual') == true)
-    return base;
+  if (item['detector_version']?.toString().startsWith('manual') == true) return base;
   final event = (item['event_time_ms'] as num?)?.toInt();
   if (event == null) return base;
   final start =
@@ -1439,9 +1628,7 @@ class _EffectOption extends StatelessWidget {
             Padding(
               padding: const EdgeInsets.only(top: 2),
               child: Icon(
-                selected
-                    ? Icons.radio_button_checked
-                    : Icons.radio_button_unchecked,
+                selected ? Icons.radio_button_checked : Icons.radio_button_unchecked,
                 size: 18,
                 color: selected ? c.orange : c.textTertiary,
               ),
@@ -1483,6 +1670,9 @@ String _formatMs(int milliseconds) {
 String _exportStageLabel(String stage) =>
     const <String, String>{
       'validate_input': '准备导出',
+      'validate_source': '校验原视频',
+      'verify_source': '复核原视频',
+      'cancelling': '正在取消导出…',
       'export_clips': '生成片段',
       'merge_clips': '合并片段',
       'persist_export': '保存导出记录',

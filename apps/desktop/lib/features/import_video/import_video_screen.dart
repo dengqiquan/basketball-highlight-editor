@@ -1,3 +1,4 @@
+import '../../core/app_diagnostics.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
@@ -13,9 +14,13 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 import '../../components/cs_button.dart';
+import '../../components/onboarding_guide.dart';
+import 'hoop_example.dart';
+import '../../providers/onboarding_provider.dart';
 import '../../components/cs_card.dart';
 import '../../components/cs_empty_state.dart';
 import '../../core/engine_session.dart';
+import '../../core/project_session.dart';
 import '../../core/roi_geometry.dart';
 import '../../core/video_orientation.dart';
 import '../../core/video_segments.dart';
@@ -28,6 +33,8 @@ import '../../theme/app_colors.dart';
 import '../../theme/tokens.dart';
 import '../review/media_readiness.dart';
 import 'player_roster_picker.dart';
+import '../../core/app_log.dart';
+import '../../core/draft_flush_registry.dart';
 
 const _beforeSecondOptions = <int>[0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 15];
 const _afterSecondOptions = <int>[1, 2, 3, 4, 5, 6, 8, 10, 12, 15];
@@ -35,6 +42,14 @@ const _afterSecondOptions = <int>[1, 2, 3, 4, 5, 6, 8, 10, 12, 15];
 /// 全页面配置向导：视频 → 分析范围 → 检测区域 → 确认并开始分析。
 ///
 /// 所有编辑先写入 workflowDraft，只有最后一步才写入项目生效配置并启动分析。
+final _importGuideStepperKey = GlobalKey(debugLabel: 'import-guide-stepper');
+final _importGuideBodyKey = GlobalKey(debugLabel: 'import-guide-body');
+final _importGuideFooterKey = GlobalKey(debugLabel: 'import-guide-footer');
+final _importGuideRoiKey = GlobalKey(debugLabel: 'import-guide-roi');
+final _importGuideRegionKey = GlobalKey(debugLabel: 'import-guide-region');
+final _importGuideModeKey = GlobalKey(debugLabel: 'import-guide-mode');
+final _importGuideClipKey = GlobalKey(debugLabel: 'import-guide-clip');
+
 class ImportVideoScreen extends ConsumerStatefulWidget {
   const ImportVideoScreen({super.key});
 
@@ -50,6 +65,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
   );
 
   int _step = 0;
+  bool _jumpToReviewWhenQueueDone = false;
   bool _draftLoaded = false;
   bool _applying = false;
   bool _showExistingDraft = false;
@@ -74,6 +90,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
   @override
   void initState() {
     super.initState();
+    registerDraftFlush(_flushDraftForShutdown);
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await _restoreDraft();
       _takePendingImport();
@@ -136,6 +153,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
         (draftVideoId == null ||
             draftVideoId == currentState.video?['id']?.toString())) {
       _applyDraftLocally(draft);
+      appLog('info', 'import', '草稿 恢复 step=${draft['step'] ?? 0}');
       setState(() => _showExistingDraft = true);
       return;
     }
@@ -247,7 +265,16 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
     };
   }
 
+  /// 区域只记画布比例（两位小数），不记画面内容。
+  static String _rectLog(Rect rect) =>
+      'x=${(rect.left * 100).toStringAsFixed(1)}% y=${(rect.top * 100).toStringAsFixed(1)}% '
+      'w=${(rect.width * 100).toStringAsFixed(1)}% h=${(rect.height * 100).toStringAsFixed(1)}%';
+
+  String _roiLogSummary() =>
+      '篮筐=${_roi == null ? '(未设置)' : _rectLog(_roi!)} 篮网=${_netRoi == null ? '(未设置)' : _rectLog(_netRoi!)}';
+
   Future<void> _persistDraft({int? step}) async {
+    if (!mounted) return;
     if (ref.read(projectProvider).video == null) return;
     try {
       await ref
@@ -267,6 +294,107 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
           );
     }
   }
+
+  /// 拖动中的草稿保存：停手 400ms 才发一次，且同一时刻只有一个保存在途。
+  /// 保存在途时又有新变更，只记脏，等这次完成后接着保存最新内容。
+  static const _draftDebounce = Duration(milliseconds: 400);
+  Timer? _draftDebounceTimer;
+  bool _draftDirty = false;
+  int? _draftPendingStep;
+  // 草稿只属于某个项目的某段视频：记下调度（或离页入队）时的身份，
+  // 真正执行时若会话已经换了项目/换过视频，这次写入直接丢弃。
+  ProjectSession? _draftSession;
+  ({String? projectId, String? videoId})? _draftTarget;
+  Future<void> _draftChain = Future<void>.value();
+  String _leaveDraftFailureText = '离开导入页时未能保存这次改动';
+
+  static ({String? projectId, String? videoId}) _draftTargetOf(
+    ProjectSession session,
+  ) => (projectId: session.projectId, videoId: session.videoId);
+
+  /// 记脏时一并记住当前项目与视频的身份。
+  void _markDraftDirty({int? step}) {
+    _draftDirty = true;
+    final session = ref.read(projectSessionProvider);
+    _draftSession = session;
+    _draftTarget = _draftTargetOf(session);
+    if (step != null) _draftPendingStep = step;
+  }
+
+  void _clearDraftIdentity() {
+    _draftTarget = null;
+    _draftSession = null;
+  }
+
+  /// 排队的写入是否还属于当前会话；会话对象是活的，切项目/切视频都会更新它。
+  bool _draftTargetStillCurrent(
+    ProjectSession session,
+    ({String? projectId, String? videoId}) target,
+  ) {
+    final now = _draftTargetOf(session);
+    final same = now == target;
+    if (!same) {
+      appLog(
+        'info',
+        'import',
+        '草稿 跳过过期写入 调度时项目=${target.projectId} 视频=${target.videoId} '
+            '当前项目=${now.projectId} 视频=${now.videoId ?? '(无)'}',
+      );
+    }
+    return same;
+  }
+
+  void _scheduleDraftSave() {
+    _markDraftDirty();
+    _draftDebounceTimer?.cancel();
+    _draftDebounceTimer = Timer(_draftDebounce, () {
+      _draftDebounceTimer = null;
+      unawaited(_flushDraft());
+    });
+  }
+
+  /// 立即保存待写内容（不等去抖），并等它完成；没有待写内容时不发请求。
+  Future<void> _saveDraftNow({int? step}) {
+    _markDraftDirty(step: step);
+    return _flushDraft();
+  }
+
+  Future<void> _flushDraft() {
+    _draftDebounceTimer?.cancel();
+    _draftDebounceTimer = null;
+    final session = _draftSession;
+    final target = _draftTarget;
+    _draftChain = _draftChain.then((_) async {
+      if (!_draftDirty) return;
+      final step = _draftPendingStep;
+      _draftDirty = false;
+      _draftPendingStep = null;
+      _clearDraftIdentity();
+      // 调度之后已经换了项目/视频：这次写入属于上一个会话，丢弃。
+      if (session != null &&
+          target != null &&
+          !_draftTargetStillCurrent(session, target)) {
+        return;
+      }
+      await _persistDraft(step: step);
+    });
+    return _draftChain;
+  }
+
+  /// apply / 清除草稿之前先把待写内容落盘，否则稍后到点的定时器会把
+  /// 已经应用并清除的旧草稿又写回去。
+  Future<void> _settleDraftBefore() async {
+    _draftDebounceTimer?.cancel();
+    _draftDebounceTimer = null;
+    // 即使当前没有待写内容也要等在途保存结束，否则 apply/清除会和它交叉。
+    await (_draftDirty ? _flushDraft() : _draftChain);
+    _draftDirty = false;
+    _draftPendingStep = null;
+    _clearDraftIdentity();
+  }
+
+  /// 关闭应用前的最后一次写入：只把还没写的内容发出去，不等去抖。
+  Future<void> _flushDraftForShutdown() => _flushDraft();
 
   Future<void> _selectVideo() async {
     final existingState = ref.read(projectProvider);
@@ -308,8 +436,11 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
         'com.apple.quicktime-movie',
       ],
     );
+    final pickWatch = Stopwatch()..start();
+    appLog('info', 'import', '打开选择视频对话框');
     if (existingVideo == null) {
       final files = await openFiles(acceptedTypeGroups: [group]);
+      appLog('info', 'import', '选择视频对话框结束 选了 ${files.length} 个 用时 ${pickWatch.elapsedMilliseconds}ms');
       if (files.isEmpty || !mounted) return;
       if (files.length > 1) {
         await _importVideoPaths([for (final file in files) file.path]);
@@ -319,6 +450,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
       return;
     }
     final file = await openFile(acceptedTypeGroups: [group]);
+    appLog('info', 'import', '选择视频对话框结束 选了 ${file == null ? 0 : 1} 个 用时 ${pickWatch.elapsedMilliseconds}ms');
     if (file == null || !mounted) return;
     await _importVideoPath(file.path);
   }
@@ -337,6 +469,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
   }
 
   Future<void> _addVideos() async {
+    appLog('info', 'import', '打开添加视频对话框');
     final files = await openFiles(
       acceptedTypeGroups: [
         XTypeGroup(
@@ -347,6 +480,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
         ),
       ],
     );
+    appLog('info', 'import', '添加视频对话框结束 选了 ${files.length} 个');
     if (files.isEmpty || !mounted) return;
     await ref
         .read(projectProvider.notifier)
@@ -356,7 +490,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
 
   String? _editingVideoId;
 
-  void _editSegment(String videoId) {
+  void _editSegment(String videoId) async {
     _stopPreviewPlayback();
     _editingVideoId = videoId;
     if (ref.read(projectProvider).video?['id']?.toString() == videoId) {
@@ -364,6 +498,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
       setState(() => _step = 1);
       return;
     }
+    await _settleDraftBefore();
     ref.read(projectProvider.notifier).activateVideo(videoId);
   }
 
@@ -378,6 +513,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
     ids
       ..removeAt(index)
       ..insert(target, videoId);
+    appLog('info', 'import', '多段 调整顺序 id=$videoId $index→$target 共=${ids.length}');
     unawaited(ref.read(projectProvider.notifier).reorderVideos(ids));
   }
 
@@ -386,12 +522,16 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
     if (_roi == null || _applying) return;
     setState(() => _applying = true);
     try {
+      await _settleDraftBefore();
       final notifier = ref.read(projectProvider.notifier);
       final applied = await notifier.applyWorkflowDraft(
         _backendDraft(step: _step),
       );
       if (!mounted || !applied) return;
+      await _settleDraftBefore();
       final videoId = ref.read(projectProvider).video?['id']?.toString();
+      appLog('info', 'import', '保存这一段设置 id=$videoId '
+          '范围=$_analysisStartMs-$_analysisEndMs ms ${_roiLogSummary()}');
       if (videoId != null) await notifier.propagateHoopToFollowingParts(videoId);
       if (mounted) setState(() => _step = 0);
     } finally {
@@ -404,10 +544,20 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
     setState(() => _applying = true);
     try {
       if (!await _importSelectedRoster()) return;
+      final queueState = ref.read(projectProvider);
+      appLog(
+        'info',
+        'import',
+        '分析全部 段数=${queueState.videos.length} 待分析='
+            '${queueState.videos.where((video) => !needsHoopConfirmation(video) && (video['analysis_job'] as Map?)?['state'] != 'completed').length}',
+      );
       await ref.read(projectProvider.notifier).startAnalysisQueue(
             beforeSeconds: _beforeSeconds.toDouble(),
             afterSeconds: _afterSeconds.toDouble(),
           );
+      // 队列真的排上了，全部分析完要自动去审核页（单段分析启动后就直接去了）。
+      _jumpToReviewWhenQueueDone =
+          ref.read(projectProvider).analysisQueue.isNotEmpty;
     } finally {
       if (mounted) setState(() => _applying = false);
     }
@@ -493,11 +643,13 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
           return;
         }
       }
-    } catch (_) {
+    } catch (error) {
+      appLog('warn', 'import_video_screen', '_importVideoPath 忽略了错误: $error');
       // 元数据预检失败时仍交给正式导入流程处理。
     }
     final previousVideoId = existingState.video?['id']?.toString();
     _rangeTouched = false;
+    await _settleDraftBefore();
     await ref.read(projectProvider.notifier).selectVideo(path);
     if (!mounted) return;
     final importedState = ref.read(projectProvider);
@@ -515,10 +667,21 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
       _step = 1;
       _showExistingDraft = false;
     });
-    await _persistDraft(step: 1);
+    await _saveDraftNow(step: 1);
+  }
+
+  Future<void> _relinkSegment(String videoId) async {
+    final notifier = ref.read(projectProvider.notifier);
+    await _settleDraftBefore();
+    if (ref.read(projectProvider).video?['id']?.toString() != videoId) {
+      notifier.activateVideo(videoId);
+    }
+    await _relinkMissingVideo();
   }
 
   Future<void> _relinkMissingVideo() async {
+    await _settleDraftBefore();
+    if (!mounted) return;
     final group = XTypeGroup(
       label: context.bheText('视频'),
       extensions: ['mp4', 'mov', 'm4v', 'avi', 'mkv'],
@@ -534,12 +697,53 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
     _draftLoaded = true;
     _syncFromState(ref.read(projectProvider));
     setState(() => _step = 1);
-    await _persistDraft(step: 1);
+    await _saveDraftNow(step: 1);
+  }
+
+  /// 离开导入页时把还没写的草稿写出去。
+  ///
+  /// 放在 deactivate 里是因为 dispose 阶段已经不能再用 ref；这里仍然接在
+  /// 同一个串行队列后面，顺序和内容都与页面内保存一致。失败用全局通知告知，
+  /// 因为此时页面已经不可见。
+  @override
+  void deactivate() {
+    if (_draftDirty && ref.read(projectProvider).video != null) {
+      final draft = _draft(step: _draftPendingStep);
+      final session = ref.read(projectSessionProvider);
+      final target = _draftTargetOf(session);
+      _draftDirty = false;
+      _draftPendingStep = null;
+      _clearDraftIdentity();
+      final notifier = ref.read(projectProvider.notifier);
+      final notices = ref.read(noticeProvider.notifier);
+      _draftChain = _draftChain.then((_) async {
+        if (!_draftTargetStillCurrent(session, target)) return;
+        try {
+          await notifier.saveWorkflowDraft(draft);
+        } catch (error) {
+          appLog('warn', 'import', '离开导入页保存草稿失败: $error');
+          notices.push(
+            NoticeMessage(
+              id:
+                  'import-draft-leave-${DateTime.now().microsecondsSinceEpoch}',
+              severity: NoticeSeverity.error,
+              title: '配置草稿保存失败',
+              description: _leaveDraftFailureText,
+            ),
+          );
+        }
+      });
+    }
+    super.deactivate();
   }
 
   @override
   void dispose() {
     _previewPlaybackTimer?.cancel();
+    retainPendingDraftWrite(_draftChain);
+    unregisterDraftFlush(_flushDraftForShutdown);
+    _draftDebounceTimer?.cancel();
+    _draftDebounceTimer = null;
     super.dispose();
   }
 
@@ -587,29 +791,24 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
     });
   }
 
+  /// 导入页阶段（0 视频 / 1 分析范围 / 2 检测区域 / 3 确认）切换只在一个地方记。
+  void _logStep(int from, String trigger) {
+    if (from == _step) return;
+    appLog('info', 'import', '导入 阶段 $from→$_step ($trigger)');
+  }
+
   Future<void> _next() async {
-    if (!_canLeaveStep(_step)) return;
-    final next = math.min(_step + 1, _stepCount - 1);
-    if (_step == 2 && next != 2) _stopPreviewPlayback();
-    setState(() => _step = next);
-    await _persistDraft(step: next);
-    // 进入检测区域步骤时,标记画面落在分析范围内,而不是停在片头或范围之外。
-    if (next == 2) {
-      final state = ref.read(projectProvider);
-      final preview = state.previewTimeMs;
-      if (preview < _analysisStartMs ||
-          (_analysisEndMs > _analysisStartMs && preview > _analysisEndMs)) {
-        ref.read(projectProvider.notifier).setPreviewTimeOnly(_analysisStartMs);
-      }
-    }
+    await _goToStep(math.min(_step + 1, _stepCount - 1), trigger: '下一步');
   }
 
   Future<void> _back() async {
     if (_step == 0) return;
     final next = _step - 1;
     if (_step == 2 && next != 2) _stopPreviewPlayback();
+    final from = _step;
     setState(() => _step = next);
-    await _persistDraft(step: next);
+    _logStep(from, '上一步');
+    await _saveDraftNow(step: next);
   }
 
   bool _canLeaveStep(int step) {
@@ -646,8 +845,12 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
       );
       if (confirmed != true || !mounted) return;
     }
+    appLog('info', 'import', '确认并开始分析 mode=$_analysisMode '
+        '范围=$_analysisStartMs-$_analysisEndMs ms before=$_beforeSeconds s '
+        'after=${_afterSeconds}s 已有候选=${state.candidates.length} $_roiLogSummary()');
     setState(() => _applying = true);
     try {
+      await _settleDraftBefore();
       final applied = await ref
           .read(projectProvider.notifier)
           .applyWorkflowDraft(_backendDraft(step: _step));
@@ -671,7 +874,25 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
 
   @override
   Widget build(BuildContext context) {
+    _leaveDraftFailureText = context.bheText('离开导入页时未能保存这次改动');
     final state = ref.watch(projectProvider);
+    ref.listen<ProjectState>(projectProvider, (previous, next) {
+      if (!_jumpToReviewWhenQueueDone ||
+          previous == null ||
+          next.queueFinishedCount <= previous.queueFinishedCount) {
+        return;
+      }
+      _jumpToReviewWhenQueueDone = false;
+      // 本次排队的每一段都成功才自动去审核；有失败就留在这里让用户看错误。
+      // 只在用户还停在导入页、且没有弹窗挡着时跳，已经去别处看了或在操作弹窗就不打断。
+      final canJump =
+          mounted &&
+          TickerMode.valuesOf(context).enabled &&
+          !Navigator.of(context, rootNavigator: true).canPop();
+      if (next.lastQueueAllCompleted && canJump) {
+        context.go('/review');
+      }
+    });
     ref.listen<List<String>?>(pendingImportProvider, (_, next) {
       if (next == null) return;
       // Let the project-change handling below settle before importing.
@@ -769,7 +990,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
         )
         .length;
 
-    return Column(
+    final content = Column(
       children: [
         Padding(
           padding: const EdgeInsets.fromLTRB(
@@ -836,21 +1057,30 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
                     ],
                   ),
                   const SizedBox(height: Spacing.md),
-                  _ImportStepper(
+KeyedSubtree(
+            key: _importGuideStepperKey,
+            child:                   _ImportStepper(
                     steps: steps,
                     summaries: stepSummaries,
                     current: _step,
-                    onStepTap: busy ? null : _goToEarlierStep,
+                    canGoToStep: _canGoToStep,
+                    onStepTap: busy ? null : _goToStep,
                   ),
+          ),
                   if (_showExistingDraft) ...[
                     const SizedBox(height: Spacing.sm),
                     _DraftBanner(
-                      onContinue: () =>
-                          setState(() => _showExistingDraft = false),
+                      onContinue: () {
+                        appLog('info', 'import', '草稿 继续编辑');
+                        setState(() => _showExistingDraft = false);
+                      },
                       onDiscard: () async {
+                        appLog('info', 'import', '草稿 丢弃');
+                        await _settleDraftBefore();
                         await ref
                             .read(projectProvider.notifier)
                             .clearWorkflowDraft();
+                        await _settleDraftBefore();
                         if (!mounted) return;
                         _syncFromState(ref.read(projectProvider));
                         setState(() {
@@ -874,15 +1104,20 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
             child: Center(
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 1240),
-                child: AnimatedSwitcher(
+                child: KeyedSubtree(
+                  key: _importGuideBodyKey,
+                  child: AnimatedSwitcher(
                   duration: const Duration(milliseconds: 180),
                   child: _buildStep(context, state, busy),
+                ),
                 ),
               ),
             ),
           ),
         ),
-        Container(
+        KeyedSubtree(
+          key: _importGuideFooterKey,
+          child: Container(
           key: const Key('import-footer'),
           decoration: BoxDecoration(
             color: c.surface,
@@ -1026,9 +1261,111 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
             ),
           ),
         ),
+        ),
       ],
     );
+    return OnboardingGuide(
+      key: ValueKey('import-guide-$_step'),
+      page: onboardingImportPage,
+      ready: _step == 0 || hasVideo,
+      hideVideo: _step == 1 || _step == 2,
+      steps: _guideSteps(_step),
+      child: content,
+    );
   }
+
+  /// 导入页每个阶段的引导；目标控件当前不存在的步骤（例如没有快速分析选项）会被跳过。
+  List<OnboardingStep> _guideSteps(int stage) => switch (stage) {
+    0 => [
+      OnboardingStep(
+        id: 'import.steps',
+        title: '导入分四步',
+        body: '选视频 → 定分析范围 → 设检测区域 → 开始分析。上面的步骤条可以点回已经完成的步骤，设置会自动保存为草稿。',
+        target: _importGuideStepperKey,
+      ),
+      OnboardingStep(
+        id: 'import.pick',
+        title: '先选原始视频',
+        body: '支持 MP4、MOV、M4V、AVI、MKV。同一场的多段视频可以一起选，会建成一个项目。原视频不会被修改或上传。',
+        target: _importGuideBodyKey,
+      ),
+    ],
+    1 => [
+      OnboardingStep(
+        id: 'range.window',
+        title: '只分析需要的一段',
+        body: '拖动时间轴两端，选出要分析的范围，比如跳过赛前热身；不确定就保持整段。范围越短，分析越快。',
+        target: _importGuideBodyKey,
+      ),
+    ],
+    2 => [
+      OnboardingStep(
+        id: 'calibrate.shootzone',
+        title: '先框投篮分析区（橙色）',
+        body:
+            '橙色框覆盖球靠近篮圈上方、穿过篮圈到落出网下的整段路线。区域要明显大于篮圈，宽约占画面的四分之一以上，太小系统会提示；别框进整块篮板、球员或地面。系统会先自动识别，不准就拖动或缩放；篮筐被挡住先换画面时间。',
+        target: _importGuideRoiKey,
+        // 示例默认就显示在侧栏里，想放大再看仍可点「看示例」。
+        extra: (context) => Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const HoopExampleList(examples: shotExamples),
+            TextButton.icon(
+              key: const Key('onboarding-examples'),
+              onPressed: () => showHoopExampleDialog(context),
+              icon: const Icon(Icons.image_outlined),
+              label: Text(context.bheText('看示例')),
+            ),
+          ],
+        ),
+        width: 360,
+        sidePanel: true,
+        extraHeight: 100,
+      ),
+      OnboardingStep(
+        id: 'calibrate.netzone',
+        title: '再框篮网检测区（白色）',
+        body:
+            '点下面的「篮网检测区」按钮切换白色框，只覆盖篮圈下沿到网底的篮网摆动范围，用来判断球有没有穿网。别框进篮板、球员或地面；改动自动保存。',
+        target: _importGuideRegionKey,
+        extra: (context) => Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const HoopExampleList(examples: netExamples),
+            TextButton.icon(
+              key: const Key('onboarding-examples'),
+              onPressed: () => showHoopExampleDialog(context),
+              icon: const Icon(Icons.image_outlined),
+              label: Text(context.bheText('看示例')),
+            ),
+          ],
+        ),
+        width: 360,
+        sidePanel: true,
+        extraHeight: 100,
+      ),
+    ],
+    _ => [
+      OnboardingStep(
+        id: 'analysis.clip',
+        title: '每个进球留多长',
+        body: '设置进球前、后各保留几秒。后面审核时，每个片段还能单独调整。',
+        target: _importGuideClipKey,
+      ),
+      OnboardingStep(
+        id: 'analysis.mode',
+        title: '标准还是快速',
+        body: '标准分析更完整、漏检少，推荐；快速分析更快，但可能漏掉少量片段。',
+        target: _importGuideModeKey,
+      ),
+      OnboardingStep(
+        id: 'analysis.start',
+        title: '开始分析',
+        body: '点右下角的按钮开始（多段视频先保存这一段的设置，再在列表里「分析全部」）。分析在后台进行，结束后到「审核」页逐个确认候选。',
+        target: _importGuideFooterKey,
+      ),
+    ],
+  };
 
   String? _nextStepLabel(BheLocalizations? l10n) => switch (_step) {
     0 => l10n?.importNextTo(l10n.analysisRange),
@@ -1037,11 +1374,33 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
     _ => null,
   };
 
-  void _goToEarlierStep(int index) {
-    if (index >= _step) return;
+  bool _canGoToStep(int index) {
+    if (index < 0 || index >= _stepCount || index == _step) return false;
+    if (index < _step) return true;
+    // 已保存的配置也能直接跳转；每个前置步骤仍走「下一步」的校验。
+    for (var step = 0; step < index; step++) {
+      if (!_canLeaveStep(step)) return false;
+    }
+    return true;
+  }
+
+  Future<void> _goToStep(int index, {String trigger = '点步骤条'}) async {
+    if (!_canGoToStep(index)) return;
     if (_step == 2 && index != 2) _stopPreviewPlayback();
+    final from = _step;
     setState(() => _step = index);
-    unawaited(_persistDraft(step: index));
+    _logStep(from, trigger);
+    await _saveDraftNow(step: index);
+    if (!mounted) return;
+    // 跳转和逐步前进都把标记画面放回所选分析范围。
+    if (index == 2) {
+      final state = ref.read(projectProvider);
+      final preview = state.previewTimeMs;
+      if (preview < _analysisStartMs ||
+          (_analysisEndMs > _analysisStartMs && preview > _analysisEndMs)) {
+        ref.read(projectProvider.notifier).setPreviewTimeOnly(_analysisStartMs);
+      }
+    }
   }
 
   Widget _buildStep(BuildContext context, ProjectState state, bool busy) {
@@ -1057,6 +1416,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
             onAfterChanged: (seconds) => setState(() => _afterSeconds = seconds),
             onAddVideos: state.busy ? null : _addVideos,
             onEdit: _editSegment,
+            onRelink: _relinkSegment,
             onMove: _moveSegment,
             onRemoveFromQueue: (videoId) => unawaited(
               ref.read(projectProvider.notifier).removeFromAnalysisQueue(videoId),
@@ -1095,7 +1455,13 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
               _analysisEndMs = end;
               _rangeTouched = true;
             });
-            unawaited(_persistDraft());
+            appLogThrottled(
+              'import-range',
+              'info',
+              'import',
+              '调整分析范围 $start-$end ms',
+            );
+            _scheduleDraftSave();
           },
         );
       case 2:
@@ -1133,7 +1499,14 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
                 }
               }
             });
-            unawaited(_persistDraft());
+            // 拖动中每帧都会回调，这里按 1 秒节流，只记区域大小比例，不记画面。
+            appLogThrottled(
+              'import-roi-${_editingNet ? 'net' : 'hoop'}',
+              'info',
+              'import',
+              '修改${_editingNet ? '篮网' : '篮筐'}区域 ${_rectLog(value)} 已经用户编辑=${_editingNet || _netUserEdited}',
+            );
+            _scheduleDraftSave();
           },
           onResetCurrent: () {
             setState(() {
@@ -1156,7 +1529,7 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
                 }
               }
             });
-            unawaited(_persistDraft());
+            _scheduleDraftSave();
           },
         );
       case 3:
@@ -1179,17 +1552,18 @@ class _ImportVideoScreenState extends ConsumerState<ImportVideoScreen> {
           ),
           onAnalysisModeChanged: (mode) {
             setState(() => _analysisMode = mode);
-            unawaited(_persistDraft());
+            appLog('info', 'import', '选择分析模式 $mode');
+            _scheduleDraftSave();
           },
           onBeforeSecondsChanged: (seconds) {
             setState(() => _beforeSeconds = seconds);
-            unawaited(_persistDraft());
+            _scheduleDraftSave();
           },
           onAfterSecondsChanged: (seconds) {
             setState(() => _afterSeconds = seconds);
-            unawaited(_persistDraft());
+            _scheduleDraftSave();
           },
-          onEditStep: busy ? null : _goToEarlierStep,
+          onEditStep: busy ? null : _goToStep,
         );
       default:
         return const SizedBox.shrink();
@@ -1204,12 +1578,14 @@ class _ImportStepper extends StatelessWidget {
     required this.steps,
     required this.summaries,
     required this.current,
+    required this.canGoToStep,
     required this.onStepTap,
   });
 
   final List<_ImportStep> steps;
   final List<String?> summaries;
   final int current;
+  final bool Function(int) canGoToStep;
   final ValueChanged<int>? onStepTap;
 
   @override
@@ -1226,7 +1602,7 @@ class _ImportStepper extends StatelessWidget {
                 final step = steps[index];
                 final active = index == current;
                 final done = index < current && step.completed;
-                final tappable = onStepTap != null && index < current;
+                final tappable = onStepTap != null && canGoToStep(index);
                 return Semantics(
                   button: tappable,
                   selected: active,
@@ -1828,6 +2204,7 @@ class _DetectionStep extends ConsumerStatefulWidget {
 }
 
 class _DetectionStepState extends ConsumerState<_DetectionStep> {
+  Timer? _readyWatch;
   late final _playback = ref.read(playbackCoordinatorProvider);
   bool _routeActive = true;
 
@@ -1863,13 +2240,12 @@ class _DetectionStepState extends ConsumerState<_DetectionStep> {
   @override
   void initState() {
     super.initState();
-    _playback.register(this, _pauseForDialog);
     unawaited(_openVideo());
   }
 
   @override
   void dispose() {
-    _playback.unregister(this);
+    _readyWatch?.cancel();
     // 组件卸载后纹理不再渲染,此时销毁是安全的(见 review 页同类处理)。
     unawaited(_positionSubscription?.cancel());
     unawaited(_playingSubscription?.cancel());
@@ -1880,10 +2256,10 @@ class _DetectionStepState extends ConsumerState<_DetectionStep> {
       if (player == null) return;
       try {
         await player.stop();
-      } catch (_) {}
+      } catch (error) { appLog('warn', 'import_video_screen', 'dispose 忽略了错误: $error'); }
       try {
-        await player.dispose();
-      } catch (_) {}
+        await disposeLoggedPlayer(player, '导入页');
+      } catch (error) { appLog('warn', 'import_video_screen', 'dispose 忽略了错误: $error'); }
     }());
     super.dispose();
   }
@@ -1915,7 +2291,7 @@ class _DetectionStepState extends ConsumerState<_DetectionStep> {
     if (path == null || path.isEmpty || !File(path).existsSync()) return;
     try {
       if (_player == null) {
-        _player = Player();
+        _player = createLoggedPlayer('导入页');
         _controller = VideoController(
           _player!,
           configuration: VideoControllerConfiguration(
@@ -1939,16 +2315,35 @@ class _DetectionStepState extends ConsumerState<_DetectionStep> {
         setState(() => _playing = playing);
       });
       await matchPlayerToSourceRotation(_player!, rotation: widget.rotation);
-      await _player!.open(Media(Uri.file(path).toString()), play: false);
-      await waitForPlayableDuration(
-        current: _player!.state.duration,
-        updates: _player!.stream.duration,
+      await openLoggedMedia(
+        _player!,
+        '导入页',
+        path,
+        video: ref.read(projectProvider).video,
       );
+      final readyWatch = _readyWatch = watchPlayerReadyTimeout('导入页');
+      try {
+        await waitForPlayableDuration(
+          current: _player!.state.duration,
+          updates: _player!.stream.duration,
+        );
+      } finally {
+        readyWatch.cancel();
+        if (identical(_readyWatch, readyWatch)) _readyWatch = null;
+      }
       final target = widget.state.previewTimeMs;
-      if (target > 0) await _player!.seek(Duration(milliseconds: target));
+      if (target > 0) {
+        try {
+          await _player!.seek(Duration(milliseconds: target));
+        } catch (error) {
+          appLog('error', 'player', '导入页 seek 失败 target=${target}ms: $error');
+          rethrow;
+        }
+      }
       _lastSyncedMs = target;
       if (mounted) setState(() => _playerReady = true);
-    } catch (_) {
+    } catch (error) {
+      appLog('warn', 'import_video_screen', '_openVideo 忽略了错误: $error');
       // 打开失败或等媒体就绪超时，回退到引擎抽帧预览。保留播放器实例：重新打开时
       // 复用，组件卸载时由 dispose() 释放；直接置空会让这个实例永远不被释放。
       if (mounted) setState(() => _playerReady = false);
@@ -2024,7 +2419,14 @@ class _DetectionStepState extends ConsumerState<_DetectionStep> {
             ),
             const SizedBox(height: Spacing.sm),
           ],
-          _RoiCanvas(
+KeyedSubtree(
+            key: _importGuideRoiKey,
+            child: ValueListenableBuilder<bool>(
+              valueListenable: videoSurfaceHidden,
+              builder: (context, hidden, _) => Center(
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(maxWidth: hidden ? 600 : double.infinity),
+                  child: _RoiCanvas(
             enabled: widget.enabled && !state.previewRefreshing,
             videoController: _playerReady ? _controller : null,
             previewPath: state.previewPath,
@@ -2041,6 +2443,10 @@ class _DetectionStepState extends ConsumerState<_DetectionStep> {
             onRefreshPreview: widget.onRefreshPreview,
             onChanged: widget.onChanged,
             onEditComplete: () {},
+                  ),
+                ),
+              ),
+            ),
           ),
           const SizedBox(height: Spacing.sm),
           _PreviewTimeControls(
@@ -2081,7 +2487,9 @@ class _DetectionStepState extends ConsumerState<_DetectionStep> {
             ),
           ],
           const SizedBox(height: Spacing.sm),
-          Row(
+          KeyedSubtree(
+            key: _importGuideRegionKey,
+            child: Row(
             children: [
               _CalibrationTargetButton(
                 index: '1',
@@ -2104,6 +2512,12 @@ class _DetectionStepState extends ConsumerState<_DetectionStep> {
               ),
               const Spacer(),
               TextButton.icon(
+                key: const Key('hoop-example-open'),
+                onPressed: () => showHoopExampleDialog(context),
+                icon: const Icon(Icons.image_outlined, size: 16),
+                label: Text(context.bheText('看示例')),
+              ),
+              TextButton.icon(
                 onPressed: widget.enabled ? widget.onResetCurrent : null,
                 icon: const Icon(Icons.restart_alt_rounded, size: 16),
                 label: Text(
@@ -2111,6 +2525,7 @@ class _DetectionStepState extends ConsumerState<_DetectionStep> {
                 ),
               ),
             ],
+          ),
           ),
           const SizedBox(height: Spacing.xs),
           Text(
@@ -2525,7 +2940,9 @@ class _SummaryStep extends StatelessWidget {
             style: theme.textTheme.titleSmall,
           ),
           const SizedBox(height: Spacing.sm),
-          Row(
+          KeyedSubtree(
+            key: _importGuideModeKey,
+            child: Row(
             children: [
               Expanded(
                 child: _AnalysisModeOption(
@@ -2552,14 +2969,18 @@ class _SummaryStep extends StatelessWidget {
               ),
             ],
           ),
+          ),
           const SizedBox(height: Spacing.md),
         ],
-        _ClipWindowSelector(
+KeyedSubtree(
+            key: _importGuideClipKey,
+            child:         _ClipWindowSelector(
           beforeSeconds: beforeSeconds,
           afterSeconds: afterSeconds,
           onBeforeChanged: onBeforeSecondsChanged,
           onAfterChanged: onAfterSecondsChanged,
         ),
+          ),
         const SizedBox(height: Spacing.md),
         Container(
           padding: const EdgeInsets.symmetric(
@@ -2997,7 +3418,6 @@ class _AnalysisRangeEditorState extends ConsumerState<_AnalysisRangeEditor> {
   @override
   void initState() {
     super.initState();
-    _playback.register(this, _pauseForDialog);
     _openVideo();
   }
 
@@ -3021,7 +3441,7 @@ class _AnalysisRangeEditorState extends ConsumerState<_AnalysisRangeEditor> {
     // player.dispose() 会触发原生 ~VideoOutput 析构,在 Windows 上与
     // 光栅线程死锁导致整个应用无响应。仅组件卸载时才销毁。
     if (_player == null && path != null && path.isNotEmpty) {
-      _player = Player();
+      _player = createLoggedPlayer('导入页');
       _controller = VideoController(
         _player!,
         configuration: VideoControllerConfiguration(
@@ -3057,7 +3477,12 @@ class _AnalysisRangeEditorState extends ConsumerState<_AnalysisRangeEditor> {
     });
     try {
       await matchPlayerToSourceRotation(player, rotation: widget.rotation);
-      await player.open(Media(Uri.file(path).toString()), play: false);
+      await openLoggedMedia(
+        player,
+        '导入页',
+        path,
+        video: ref.read(projectProvider).video,
+      );
       _playbackRequested = false;
       await player.pause();
       if (mounted &&
@@ -3083,7 +3508,6 @@ class _AnalysisRangeEditorState extends ConsumerState<_AnalysisRangeEditor> {
 
   @override
   void dispose() {
-    _playback.unregister(this);
     _mediaGeneration++;
     unawaited(_positionSubscription?.cancel());
     unawaited(_playingSubscription?.cancel());
@@ -3094,10 +3518,10 @@ class _AnalysisRangeEditorState extends ConsumerState<_AnalysisRangeEditor> {
       if (player == null) return;
       try {
         await player.stop();
-      } catch (_) {}
+      } catch (error) { appLog('warn', 'import_video_screen', 'dispose 忽略了错误: $error'); }
       try {
-        await player.dispose();
-      } catch (_) {}
+        await disposeLoggedPlayer(player, '导入页');
+      } catch (error) { appLog('warn', 'import_video_screen', 'dispose 忽略了错误: $error'); }
     }());
     super.dispose();
   }
@@ -4012,7 +4436,8 @@ class _RoiCanvasState extends State<_RoiCanvas> {
                               : null,
                           child: Stack(
                             children: [
-                              if (widget.videoController != null)
+                              if (widget.videoController != null &&
+                                  !(videoSurfaceHidden.value && widget.previewPath != null && File(widget.previewPath!).existsSync()))
                                 Positioned.fill(
                                   // 框已是视频比例。Windows 软件渲染的纹理比例
                                   // 可能不对、里面带黑边,cover 正好把黑边裁掉,
@@ -4383,6 +4808,7 @@ class _VideoSegmentList extends StatelessWidget {
     required this.onAfterChanged,
     required this.onAddVideos,
     required this.onEdit,
+    required this.onRelink,
     required this.onMove,
     required this.onRemoveFromQueue,
     required this.onPauseQueue,
@@ -4397,6 +4823,7 @@ class _VideoSegmentList extends StatelessWidget {
   final ValueChanged<int> onAfterChanged;
   final VoidCallback? onAddVideos;
   final ValueChanged<String> onEdit;
+  final ValueChanged<String>? onRelink;
   final void Function(String videoId, int offset) onMove;
   final ValueChanged<String> onRemoveFromQueue;
   final VoidCallback onPauseQueue;
@@ -4435,6 +4862,9 @@ class _VideoSegmentList extends StatelessWidget {
                   state: state,
                   active: video['id'] == state.video?['id'],
                   onEdit: busy ? null : () => onEdit(video['id'].toString()),
+                  onRelink: (video['source_exists'] == false) && !busy
+                      ? onRelink
+                      : null,
                   onMoveUp: reorderLocked || index == 0
                       ? null
                       : () => onMove(video['id'].toString(), -1),
@@ -4545,6 +4975,7 @@ class _VideoSegmentRow extends StatelessWidget {
     required this.state,
     required this.active,
     required this.onEdit,
+    required this.onRelink,
     required this.onMoveUp,
     required this.onMoveDown,
     required this.onRemoveFromQueue,
@@ -4556,6 +4987,7 @@ class _VideoSegmentRow extends StatelessWidget {
   final ProjectState state;
   final bool active;
   final VoidCallback? onEdit;
+  final ValueChanged<String>? onRelink;
   final VoidCallback? onMoveUp;
   final VoidCallback? onMoveDown;
   final VoidCallback onRemoveFromQueue;
@@ -4666,6 +5098,19 @@ class _VideoSegmentRow extends StatelessWidget {
                         context.bheText('原视频已移动'),
                         style: theme.textTheme.labelSmall?.copyWith(
                           color: c.error,
+                        ),
+                      ),
+                    if (onRelink != null)
+                      TextButton.icon(
+                        key: ValueKey('video-segment-relink-$id'),
+                        onPressed: () => onRelink!(video['id'].toString()),
+                        icon: const Icon(Icons.link_rounded, size: 14),
+                        label: Text(context.bheText('重新定位')),
+                        style: TextButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          minimumSize: const Size(0, 28),
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                         ),
                       ),
                     Text(

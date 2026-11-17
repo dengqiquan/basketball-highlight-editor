@@ -1,0 +1,311 @@
+import 'dart:async';
+import 'dart:ffi' show Abi;
+import 'dart:io';
+import 'dart:ui' as ui;
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
+import 'package:media_kit/media_kit.dart';
+
+import 'app_log.dart';
+import 'engine_session.dart' show JsonMap;
+import 'player_audio_settings.dart';
+import 'diagnostics.dart' show appVersion;
+
+/// 界面线程卡顿的判定：监控定时器本该每 [interval] 触发一次，实际间隔超出
+/// [threshold] 就算卡顿，返回卡了多久（毫秒）；否则返回 null。
+int? uiStallMilliseconds({
+  required Duration elapsed,
+  required Duration interval,
+  required Duration threshold,
+}) {
+  final late = elapsed - interval;
+  return late >= threshold ? late.inMilliseconds : null;
+}
+
+/// 一行「会话开始」日志：版本、系统、屏幕和缩放。用户反馈的日志里先看这一行，
+/// 就知道是哪个版本、什么系统、窗口多大、缩放多少。
+String sessionStartLine({
+  required String version,
+  required String mode,
+  required String os,
+  required String arch,
+  required int cpus,
+  required String locale,
+  required List<String> displays,
+  required double textScale,
+}) =>
+    '会话开始 version=$version mode=$mode os=$os arch=$arch cpus=$cpus '
+    'locale=$locale textScale=$textScale displays=[${displays.join('; ')}]';
+
+String describeViews(Iterable<ui.FlutterView> views) => [
+  for (final view in views)
+    'view${view.viewId} physical=${view.physicalSize.width.round()}x${view.physicalSize.height.round()} '
+        'dpr=${view.devicePixelRatio}',
+].join('; ');
+
+/// 启动时调用一次：写「会话开始」，并开始记录窗口尺寸/缩放变化、前后台切换，
+/// 以及界面线程卡顿（Windows「点了没反应」这类问题靠它定位卡在哪一步之后）。
+class AppDiagnostics with WidgetsBindingObserver {
+  AppDiagnostics._();
+
+  static AppDiagnostics? _instance;
+
+  static void start() {
+    if (_instance != null) return;
+    final diagnostics = AppDiagnostics._();
+    _instance = diagnostics;
+    final binding = WidgetsBinding.instance;
+    binding.addObserver(diagnostics);
+    final dispatcher = binding.platformDispatcher;
+    appLog(
+      'info',
+      'app',
+      sessionStartLine(
+        version: appVersion,
+        mode: kReleaseMode ? 'release' : (kProfileMode ? 'profile' : 'debug'),
+        os: '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+        arch: '${Abi.current()}',
+        cpus: Platform.numberOfProcessors,
+        locale: Platform.localeName,
+        displays: [describeViews(dispatcher.views)],
+        textScale: dispatcher.textScaleFactor,
+      ),
+    );
+    diagnostics._startWatchdog();
+  }
+
+  static const _interval = Duration(milliseconds: 250);
+  static const _stallThreshold = Duration(milliseconds: 1500);
+
+  final Stopwatch _clock = Stopwatch()..start();
+  Duration _lastTick = Duration.zero;
+  bool _foreground = true;
+  Timer? _metricsDebounce;
+
+  void _startWatchdog() {
+    _lastTick = _clock.elapsed;
+    Timer.periodic(_interval, (_) {
+      final now = _clock.elapsed;
+      final elapsed = now - _lastTick;
+      _lastTick = now;
+      // 窗口在后台/最小化时系统会降频定时器，不算卡顿。
+      if (!_foreground) return;
+      final stalled = uiStallMilliseconds(
+        elapsed: elapsed,
+        interval: _interval,
+        threshold: _stallThreshold,
+      );
+      if (stalled != null) {
+        appLog(
+          'warn',
+          'ui',
+          '界面线程卡顿约 $stalled ms；卡顿前最后记录的一步：$lastAppLogLine',
+        );
+      }
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _foreground = state == AppLifecycleState.resumed;
+    if (_foreground) _lastTick = _clock.elapsed;
+    appLog('info', 'app', '应用状态 ${state.name}');
+  }
+
+  @override
+  void didChangeMetrics() {
+    _metricsDebounce?.cancel();
+    _metricsDebounce = Timer(const Duration(milliseconds: 500), () {
+      final dispatcher = WidgetsBinding.instance.platformDispatcher;
+      appLog(
+        'info',
+        'app',
+        '窗口或缩放变化 ${describeViews(dispatcher.views)} textScale=${dispatcher.textScaleFactor}',
+      );
+    });
+  }
+}
+
+/// 日志里描述一段视频：只写分辨率、帧率、编码、时长、大小和扩展名，不写路径。
+String describeVideoForLog(Map<String, dynamic>? video) {
+  if (video == null) return '(无)';
+  final path = video['source_path']?.toString() ?? '';
+  final dot = path.lastIndexOf('.');
+  final ext = dot < 0 || dot < path.length - 6 ? '?' : path.substring(dot + 1).toLowerCase();
+  return 'id=${video['id']} ${video['width']}x${video['height']} '
+      'fps=${video['fps']} video=${video['video_codec']} audio=${video['audio_codec']} '
+      'rotation=${video['rotation']} duration_ms=${video['duration_ms']} '
+      'size=${video['source_size_bytes']} ext=$ext';
+}
+
+/// 播放器出错、mpv 报错都写进日志；[where] 说明是哪个页面的播放器。
+Player createLoggedPlayer(String where) {
+  final player = Player();
+  appLog('info', 'player', '$where 创建播放器');
+  // 新建的播放器立刻套用记住的音量/静音设置，之后设置变化也会同步回来。
+  playerAudioSettings.registerPlayer(player);
+  player.stream.error.listen((error) {
+    appLog('error', 'player', '$where 播放器报错: $error');
+  });
+  player.stream.log.listen((entry) {
+    if (entry.level != 'error' && entry.level != 'fatal') return;
+    final text = entry.text.trim();
+    // mpv 对没注册过的 OSC 属性报的这一条是已知无害提示，降成 debug：
+    // 它此前被记成 error，还会被当成「界面卡顿时最后一步」，把排查带偏。
+    if (isHarmlessMpvLog(text)) {
+      appLog('debug', 'player', '$where mpv ${entry.prefix}: $text');
+      return;
+    }
+    appLog('error', 'player', '$where mpv ${entry.prefix}: $text');
+  });
+  return player;
+}
+
+/// mpv 的已知无害提示：只认 OSC 这一条，其它一律照常记 error。
+bool isHarmlessMpvLog(String text) => text.contains('_setProperty(osc');
+
+/// 销毁播放器并记一行；[where] 说明是哪个页面。
+Future<void> disposeLoggedPlayer(Player player, String where) async {
+  appLog('info', 'player', '$where 销毁播放器');
+  playerAudioSettings.unregisterPlayer(player);
+  await player.dispose();
+}
+
+/// 打开后 [timeout] 内还没拿到可播放时长就记一行 warn（默认 10 秒）。
+/// 返回的 [Timer] 由调用方在 ready 后取消，测试里也可以手动触发。
+Timer watchPlayerReadyTimeout(
+  String where, {
+  Duration timeout = const Duration(seconds: 10),
+}) {
+  return Timer(timeout, () {
+    appLog('warn', 'player', playerReadyTimeoutLine(where, timeout));
+  });
+}
+
+/// 就绪超时那行日志的文案（单独抽出来便于测试）。
+String playerReadyTimeoutLine(String where, Duration timeout) =>
+    '$where 打开后 ${timeout.inSeconds} 秒仍未就绪';
+
+/// 把本地文件路径转成传给 mpv 的地址。
+///
+/// Windows 的 UNC 路径(`\\server\share\...` 或 `//server/share/...`)不能经
+/// `Uri.file` 转换:那会产出 `file://server/share/...`,而 mpv 的 file://
+/// 协议不支持网络主机名——loadfile 之后直接回到 idle、不报错、元数据永远
+/// 探测不到,NAS/共享文件夹里的视频因此黑屏(用随包的 libmpv 实测:`file://`
+/// +主机名的两种写法都打不开,原始 UNC 路径 0.3 秒出时长)。UNC 直接把原始
+/// 路径交给 mpv(media_kit 的 [Media] 原样透传),mpv 原生支持反斜杠和非
+/// ASCII 字符;其余路径(盘符、macOS/Linux)维持 file:// URI 不变,是已验证
+/// 可用的形式。
+String mpvLocationFor(String path, {required bool isWindows}) {
+  if (isWindows && (path.startsWith(r'\\') || path.startsWith('//'))) {
+    return path;
+  }
+  return Uri.file(path).toString();
+}
+
+/// `video` 里色彩信息为 HDR（PQ/HLG + 10bit + BT.2020）时给 mpv 设色调映射。
+/// 判定与引擎 color_plan 的前半段一致；ffmpeg 滤镜是否可用由 mpv 自己决定。
+bool isHdrVideoForPlayer(JsonMap? video) {
+  if (video == null) return false;
+  final pix = (video['pix_fmt'] ?? '').toString().toLowerCase();
+  final transfer = (video['color_transfer'] ?? '').toString().toLowerCase();
+  final primaries = (video['color_primaries'] ?? '').toString().toLowerCase();
+  final space = (video['color_space'] ?? '').toString().toLowerCase();
+  if (pix.isEmpty || pix == 'unknown' || transfer.isEmpty || transfer == 'unknown') {
+    return false;
+  }
+  if (transfer != 'smpte2084' && transfer != 'arib-std-b67') return false;
+  if (!RegExp(r'(?:p10|p010)(?:le|be)?$').hasMatch(pix)) return false;
+  if (primaries != 'bt2020') return false;
+  return space == 'bt2020nc' || space == 'bt2020c';
+}
+
+/// HDR 时给 mpv 设的最小色调映射属性集，与导出 ffmpeg 的 hable + bt709 对齐。
+const hdrToneMappingProperties = <String, String>{
+  'tone-mapping': 'hable',
+  'hdr-compute-peak': 'yes',
+  'target-trc': 'bt.1886',
+  'target-prim': 'bt.709',
+};
+
+/// HDR 用过后切到非 HDR 源片时恢复成 mpv 默认值，避免 SDR 仍被 bt.1886 等属性影响。
+const hdrToneMappingResetProperties = <String, String>{
+  'tone-mapping': 'auto',
+  'hdr-compute-peak': 'auto',
+  'target-trc': 'auto',
+  'target-prim': 'auto',
+};
+
+/// 记下「这个 player 上设过 HDR 属性」。弱引用，player 释放后自动失效。
+final Expando<bool> _hdrAppliedByPlayer = Expando<bool>('hdrToneMappingApplied');
+
+/// 按当前视频决定要设哪些属性，并逐条设置（每条单独 try/catch，失败只记日志并继续）。
+///
+/// 返回设置之后「这个 player 上是否留有 HDR 属性」：
+/// - HDR 且此前没设过：写 [hdrToneMappingProperties]，返回 true；
+/// - HDR 且已设过：不重复设置，返回 true；
+/// - 非 HDR 且已设过：写 [hdrToneMappingResetProperties]，返回 false（复位后清标记）；
+/// - 非 HDR 且从没设过：一条都不调，返回 false。
+///
+/// 独立成函数是为了能脱离真实 Player 测试（本仓库没有 PlatformPlayer 的假实现）。
+Future<bool> applyToneMappingStep({
+  required bool alreadyApplied,
+  required JsonMap? video,
+  required String where,
+  required Future<void> Function(String name, String value) setProperty,
+}) async {
+  Map<String, String> plan;
+  if (isHdrVideoForPlayer(video)) {
+    if (alreadyApplied) return true;
+    plan = hdrToneMappingProperties;
+  } else {
+    if (!alreadyApplied) return false;
+    plan = hdrToneMappingResetProperties;
+  }
+  for (final entry in plan.entries) {
+    try {
+      await setProperty(entry.key, entry.value);
+    } catch (error) {
+      appLog('warn', 'player', '$where 设置 mpv ${entry.key} 失败（忽略）: $error');
+    }
+  }
+  return isHdrVideoForPlayer(video);
+}
+
+/// 逐条设置，某条失败只记日志、不影响打开播放，也不影响其余属性。
+Future<void> applyHdrToneMapping(Player player, String where, JsonMap? video) async {
+  final platform = player.platform;
+  if (platform is! NativePlayer) return;
+  final applied = await applyToneMappingStep(
+    alreadyApplied: _hdrAppliedByPlayer[player] ?? false,
+    video: video,
+    where: where,
+    setProperty: platform.setProperty,
+  );
+  _hdrAppliedByPlayer[player] = applied;
+}
+
+/// 带耗时地记录打开视频：播放器 open 慢或失败时，日志里能看出是哪个文件类型、卡了多久。
+/// 传了 [video] 且是 HDR 时，打开前先按 [applyHdrToneMapping] 设色调映射。
+Future<void> openLoggedMedia(
+  Player player,
+  String where,
+  String path, {
+  JsonMap? video,
+}) async {
+  final watch = Stopwatch()..start();
+  final dot = path.lastIndexOf('.');
+  final ext = dot < 0 ? '?' : path.substring(dot + 1).toLowerCase();
+  await applyHdrToneMapping(player, where, video);
+  try {
+    await player.open(
+      Media(mpvLocationFor(path, isWindows: Platform.isWindows)),
+      play: false,
+    );
+    appLog('info', 'player', '$where 打开视频 ext=$ext 用时 ${watch.elapsedMilliseconds}ms');
+  } catch (error) {
+    appLog('error', 'player', '$where 打开视频失败 ext=$ext 用时 ${watch.elapsedMilliseconds}ms: $error');
+    rethrow;
+  }
+}

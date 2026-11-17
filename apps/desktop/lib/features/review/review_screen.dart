@@ -9,6 +9,10 @@ import 'package:go_router/go_router.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:bhe_l10n/bhe_l10n.dart';
+import 'package:bhe_core/bhe_core.dart' show nearestReviewCandidate;
+import '../../core/app_diagnostics.dart';
+import '../../core/engine_session.dart' show JsonMap;
+import '../../core/player_audio_settings.dart';
 
 import '../feedback/feedback_dialog.dart';
 import '../../components/cs_button.dart';
@@ -17,6 +21,8 @@ import '../../components/cs_progress_track.dart';
 import 'candidate_status_labels.dart';
 import '../../core/video_orientation.dart';
 import '../../providers/player_groups_provider.dart';
+import '../../components/onboarding_guide.dart';
+import '../../providers/onboarding_provider.dart';
 import '../../providers/project_state.dart';
 import '../../providers/playback_coordinator.dart';
 import '../../theme/app_colors.dart';
@@ -24,7 +30,9 @@ import '../../theme/tokens.dart';
 import 'clip_range_timeline.dart';
 import 'media_readiness.dart';
 import 'player_group_editor.dart';
+import 'review_shortcuts.dart';
 import 'review_video_viewport.dart';
+import '../../core/app_log.dart';
 
 bool _annotationHintSeen = false;
 
@@ -41,9 +49,18 @@ class ReviewScreen extends ConsumerStatefulWidget {
   ConsumerState<ReviewScreen> createState() => _ReviewScreenState();
 }
 
+final _reviewGuideTagKey = GlobalKey(debugLabel: 'review-guide-tag');
+final _reviewGuideRangeKey = GlobalKey(debugLabel: 'review-guide-range');
+final _reviewGuideSourceKey = GlobalKey(debugLabel: 'review-guide-source');
+final _reviewGuideFilterKey = GlobalKey(debugLabel: 'review-guide-filter');
+final _reviewGuideBatchKey = GlobalKey(debugLabel: 'review-guide-batch');
+final _reviewGuideMissedKey = GlobalKey(debugLabel: 'review-guide-missed');
+
 class _ReviewScreenState extends ConsumerState<ReviewScreen> {
   String? _selectedCandidateId;
   bool _showOriginalVideo = false;
+  final _guideVideoKey = GlobalKey();
+  final _guideQueueKey = GlobalKey();
   final Set<String> _reviewStartedCandidateIds = <String>{};
   String _candidateFilter = 'all';
   String _playerFilter = 'all';
@@ -188,6 +205,15 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
     String? rim,
     String? segment,
   }) {
+    final previous = _selectedCandidate(_filterCandidates(
+      _orderedCandidates(ref.read(projectProvider).candidates),
+      _candidateFilter,
+      playerFilter: _playerFilter,
+      rimFilter: _rimFilter,
+      segmentFilter: _segmentFilter,
+    ));
+    final anchorMs = _videoController.playingPositionMs ??
+        (previous == null ? 0 : _clipStart(previous));
     setState(() {
       _candidateFilter = status ?? _candidateFilter;
       _playerFilter = player ?? _playerFilter;
@@ -200,13 +226,20 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
         rimFilter: _rimFilter,
         segmentFilter: _segmentFilter,
       );
-      _selectedCandidateId = _selectedCandidate(candidates)?['id']?.toString();
+      _selectedCandidateId = nearestReviewCandidate(
+        candidates,
+        anchorMs: anchorMs,
+        startMs: _clipStart,
+      )?['id']?.toString();
+      if (_selectedCandidateId != null) _replayToken++;
     });
     final id = _selectedCandidateId;
     if (id != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _ensureCandidateVisible(id);
       });
+    } else {
+      unawaited(_videoController.pause());
     }
   }
 
@@ -375,6 +408,15 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
     );
   }
 
+  /// 方向键给候选翻页了，音量用 - / =（以及数字键盘 +/-）按 10 步进。
+  ///
+  /// 静音中按这两个键：按记住的音量加减，并自动取消静音（不会从 0 开始）。
+  void _nudgeVolume(int delta) {
+    final settings = playerAudioSettings;
+    settings.setVolume(settings.volume + delta);
+    appLog('info', 'player', '音量 ${settings.volume}%');
+  }
+
   KeyEventResult _handleShortcut(
     KeyEvent event, {
     required List<Map<String, dynamic>> candidates,
@@ -391,34 +433,41 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
         !(commandPressed && key == LogicalKeyboardKey.keyZ)) {
       return KeyEventResult.ignored;
     }
-    if (key == LogicalKeyboardKey.arrowUp) {
-      _moveCandidate(candidates, -1);
-    } else if (key == LogicalKeyboardKey.arrowDown) {
-      _moveCandidate(candidates, 1);
-    } else if (key == LogicalKeyboardKey.arrowLeft) {
-      _seekBySeconds(keyboard.isShiftPressed ? -0.1 : -2);
-    } else if (key == LogicalKeyboardKey.arrowRight) {
-      _seekBySeconds(keyboard.isShiftPressed ? 0.1 : 2);
-    } else if (key == LogicalKeyboardKey.space) {
-      _togglePlayback();
-    } else if (key == LogicalKeyboardKey.keyA) {
-      _videoController.toggleAnnotations();
-    } else if (key == LogicalKeyboardKey.keyL) {
-      _toggleCandidateLoop();
-    } else if (key == LogicalKeyboardKey.keyZ && commandPressed) {
-      if (!reviewLocked) unawaited(notifier.undoReview());
-    } else if (key == LogicalKeyboardKey.keyX ||
-        key == LogicalKeyboardKey.backquote ||
-        key == LogicalKeyboardKey.backspace) {
-      final id = selected?['id']?.toString();
-      if (!reviewLocked && id != null) {
-        unawaited(_setCandidateStatus(id, 'excluded'));
-      }
-    } else if (key == LogicalKeyboardKey.keyC ||
-        key == LogicalKeyboardKey.enter) {
-      final id = selected?['id']?.toString();
-      if (!reviewLocked && id != null) {
-        unawaited(_setCandidateStatus(id, 'included'));
+    final action = reviewShortcutActionFor(key, commandPressed: commandPressed);
+    if (action != null) {
+      switch (action) {
+        case ReviewShortcutAction.previousCandidate:
+          _moveCandidate(candidates, -1);
+        case ReviewShortcutAction.nextCandidate:
+          _moveCandidate(candidates, 1);
+        case ReviewShortcutAction.seekBack:
+          _seekBySeconds(keyboard.isShiftPressed ? -0.1 : -2);
+        case ReviewShortcutAction.seekForward:
+          _seekBySeconds(keyboard.isShiftPressed ? 0.1 : 2);
+        case ReviewShortcutAction.playPause:
+          _togglePlayback();
+        case ReviewShortcutAction.annotations:
+          _videoController.toggleAnnotations();
+        case ReviewShortcutAction.loop:
+          _toggleCandidateLoop();
+        case ReviewShortcutAction.undo:
+          if (!reviewLocked) unawaited(notifier.undoReview());
+        case ReviewShortcutAction.exclude:
+          final id = selected?['id']?.toString();
+          if (!reviewLocked && id != null) {
+            unawaited(_setCandidateStatus(id, 'excluded'));
+          }
+        case ReviewShortcutAction.include:
+          final id = selected?['id']?.toString();
+          if (!reviewLocked && id != null) {
+            unawaited(_setCandidateStatus(id, 'included'));
+          }
+        case ReviewShortcutAction.toggleMute:
+          playerAudioSettings.toggleMute();
+        case ReviewShortcutAction.volumeDown:
+          _nudgeVolume(-10);
+        case ReviewShortcutAction.volumeUp:
+          _nudgeVolume(10);
       }
     } else if (_playerShortcutIndex(key) case final int index) {
       // 0 clears the tag; the other keys follow the player order shown in the tag menu.
@@ -436,65 +485,19 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
     return KeyEventResult.handled;
   }
 
-  static const List<(LogicalKeyboardKey, LogicalKeyboardKey)> _playerKeys = [
-    (LogicalKeyboardKey.digit0, LogicalKeyboardKey.numpad0),
-    (LogicalKeyboardKey.digit1, LogicalKeyboardKey.numpad1),
-    (LogicalKeyboardKey.digit2, LogicalKeyboardKey.numpad2),
-    (LogicalKeyboardKey.digit3, LogicalKeyboardKey.numpad3),
-    (LogicalKeyboardKey.digit4, LogicalKeyboardKey.numpad4),
-    (LogicalKeyboardKey.digit5, LogicalKeyboardKey.numpad5),
-    (LogicalKeyboardKey.digit6, LogicalKeyboardKey.numpad6),
-    (LogicalKeyboardKey.digit7, LogicalKeyboardKey.numpad7),
-    (LogicalKeyboardKey.digit8, LogicalKeyboardKey.numpad8),
-    (LogicalKeyboardKey.digit9, LogicalKeyboardKey.numpad9),
-    // 第 10 个以后用 Q 到 P 这一排字母。
-    (LogicalKeyboardKey.keyQ, LogicalKeyboardKey.keyQ),
-    (LogicalKeyboardKey.keyW, LogicalKeyboardKey.keyW),
-    (LogicalKeyboardKey.keyE, LogicalKeyboardKey.keyE),
-    (LogicalKeyboardKey.keyR, LogicalKeyboardKey.keyR),
-    (LogicalKeyboardKey.keyT, LogicalKeyboardKey.keyT),
-    (LogicalKeyboardKey.keyY, LogicalKeyboardKey.keyY),
-    (LogicalKeyboardKey.keyU, LogicalKeyboardKey.keyU),
-    (LogicalKeyboardKey.keyI, LogicalKeyboardKey.keyI),
-    (LogicalKeyboardKey.keyO, LogicalKeyboardKey.keyO),
-    (LogicalKeyboardKey.keyP, LogicalKeyboardKey.keyP),
-  ];
-
   int? _playerShortcutIndex(LogicalKeyboardKey key) {
-    final index = _playerKeys.indexWhere(
+    final index = reviewPlayerKeys.indexWhere(
       (pair) => pair.$1 == key || pair.$2 == key,
     );
     return index < 0 ? null : index;
   }
 
-  Future<({int startMs, int endMs})?> _showRangeDialog(
-    WidgetBuilder builder,
-  ) async {
-    try {
-      return await ref.read(playbackCoordinatorProvider).withPausedPlayback(() {
-        if (!mounted) return Future<({int startMs, int endMs})?>.value();
-        return showDialog<({int startMs, int endMs})>(
-          context: context,
-          builder: builder,
-        );
-      });
-    } catch (error) {
-      if (mounted) {
-        final l10n = Localizations.of<BheLocalizations>(
-          context,
-          BheLocalizations,
-        );
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              l10n?.reviewRangeOpenFailed(error.toString()) ??
-                  '无法暂停预览并打开范围编辑：$error',
-            ),
-          ),
-        );
-      }
-      return null;
-    }
+  Future<({int startMs, int endMs})?> _showRangeDialog(WidgetBuilder builder) {
+    if (!mounted) return Future<({int startMs, int endMs})?>.value();
+    return showDialog<({int startMs, int endMs})>(
+      context: context,
+      builder: builder,
+    );
   }
 
   Future<void> _editClipRange(Map<String, dynamic> candidate) async {
@@ -511,6 +514,7 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
     final result = await _showRangeDialog(
       (dialogContext) => _ClipRangeDialog(
         videoPath: ref.read(projectProvider).videoPath,
+        video: ref.read(projectProvider).video,
         frameSize: _videoFrameSize(ref.read(projectProvider).video),
         rotation: _videoRotation(ref.read(projectProvider).video),
         startMs: _clipStart(candidate),
@@ -550,6 +554,7 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
     final result = await _showRangeDialog(
       (dialogContext) => _ClipRangeDialog(
         videoPath: state.videoPath,
+        video: state.video,
         frameSize: _videoFrameSize(state.video),
         rotation: _videoRotation(state.video),
         startMs: startMs,
@@ -744,7 +749,7 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
         ? () => _confirmReanalyzeWithMode(forceStandard: true)
         : _confirmReanalyze;
 
-    return Focus(
+    final content = Focus(
       key: const Key('review-shortcut-focus'),
       focusNode: _shortcutFocusNode,
       autofocus: true,
@@ -797,7 +802,7 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
-                  final video = _VideoPane(
+                  final videoPane = _VideoPane(
                     controller: _videoController,
                     videoPath: playbackPath,
                     candidate: selected,
@@ -862,10 +867,14 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
                     },
                     onDeletePlayer: _deletePlayer,
                   );
+                  final video = KeyedSubtree(
+                    key: _guideVideoKey,
+                    child: videoPane,
+                  );
                   final queueWidth = (constraints.maxWidth * 0.30)
                       .clamp(360.0, 460.0)
                       .toDouble();
-                  final queue = _CandidatePanel(
+                  final queuePanel = _CandidatePanel(
                     candidates: candidates,
                     overlappingIds: _overlappingCandidateIds(allCandidates),
                     selectedId: selected?['id']?.toString(),
@@ -944,6 +953,10 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
                         ? null
                         : () => context.go('/export'),
                   );
+                  final queue = KeyedSubtree(
+                    key: _guideQueueKey,
+                    child: queuePanel,
+                  );
                   if (constraints.maxWidth >= Breakpoints.md) {
                     return Container(
                       color: AppColors.of(context).surface,
@@ -992,6 +1005,70 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
         ),
       ),
     );
+    return OnboardingGuide(
+      page: onboardingReviewPage,
+      ready: allCandidates.isNotEmpty && !state.hydrating,
+      hideVideo: true,
+      onFinished: _focusReviewShortcuts,
+      steps: [
+        OnboardingStep(
+          id: 'review.video',
+          title: '这里看视频',
+          body: '选中一个候选就会播放对应的片段，每个候选前后会多留一点画面。',
+          target: _guideVideoKey,
+        ),
+        OnboardingStep(
+          id: 'review.queue',
+          title: '这里是找到的候选',
+          body: '每一行是系统认为可能进球的一段。逐个看一遍，是进球就保留，不是就排除。',
+          target: _guideQueueKey,
+        ),
+        OnboardingStep(
+          id: 'review.filter',
+          title: '全部 / 保留 / 排除',
+          body:
+              '「全部」是系统找到的所有候选；「保留」是还没被排除的（包括你点了保留的和还没审核的）；「排除」是你打了叉的。\n推荐：看完一遍后点「保留」再过一遍，这里的就是最终会导出的；还可以在「保留」里接着按球员标签、篮筐检测结果筛选，挑出要重点检查的。',
+          target: _reviewGuideFilterKey,
+        ),
+        OnboardingStep(
+          id: 'review.batch',
+          title: '批量设置片段时长',
+          body: '想把所有片段统一加长或缩短，点这个按钮，设置每个进球「前」「后」各留几秒。只作用于当前列表里的候选（会随上面的筛选变化），默认不覆盖你手动调整过的片段。',
+          target: _reviewGuideBatchKey,
+        ),
+        OnboardingStep(
+          id: 'review.shortcuts',
+          title: '常用快捷键',
+          body:
+              '${reviewShortcutGuideText(context)}\n${context.bheText('完整列表：右上角「更多」→「快捷键一览」')}',
+        ),
+        OnboardingStep(
+          id: 'review.tag',
+          title: '给片段打球员标签',
+          body: '点这里选球员；还没有球员就新建，也可以从「球员分组」一键导入。打过标签，导出时可以每个球员各出一个视频。',
+          target: _reviewGuideTagKey,
+        ),
+        OnboardingStep(
+          id: 'review.range',
+          title: '片段前后不对？调范围',
+          body: '点这里打开范围编辑：拖动两端、拖到边缘继续延长，或播放到合适位置按 I 设为开始、O 设为结束。原视频不会被修改。',
+          target: _reviewGuideRangeKey,
+        ),
+        OnboardingStep(
+          id: 'review.source',
+          title: '候选预览 / 原视频',
+          body: '切到「原视频」可以看整段录像、补上系统没找到的进球。',
+          target: _reviewGuideSourceKey,
+        ),
+        OnboardingStep(
+          id: 'review.missed',
+          title: '补漏：系统漏掉的进球',
+          body: '先切到「原视频」，播放到漏掉的进球附近，再点「补漏片段」：会以当前位置作为进球时刻新建一个候选，在弹出的窗口里用 I / O 或拖动定好开始和结束，点「加入候选」即可。',
+          target: _reviewGuideMissedKey,
+        ),
+      ],
+      child: content,
+    );
   }
 
   int _candidateIndex(
@@ -1014,6 +1091,20 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
   }
 
   void _ensureCandidateVisible(String id) {
+    if (!mounted) return;
+    final state = ref.read(projectProvider);
+    final candidates = _filterCandidates(
+      _orderedCandidates(state.candidates),
+      _candidateFilter,
+      playerFilter: _playerFilter,
+      rimFilter: _rimFilter,
+      segmentFilter: _segmentFilter,
+    );
+    if (_selectedCandidate(candidates)?['id']?.toString() != id) return;
+    final index = candidates.indexWhere(
+      (candidate) => candidate['id']?.toString() == id,
+    );
+    if (index < 0) return;
     final targetContext = _candidateRowContexts[id];
     if (targetContext != null && targetContext.mounted) {
       unawaited(
@@ -1027,18 +1118,6 @@ class _ReviewScreenState extends ConsumerState<ReviewScreen> {
       return;
     }
     if (!_candidateScrollController.hasClients) return;
-    final state = ref.read(projectProvider);
-    final candidates = _filterCandidates(
-      _orderedCandidates(state.candidates),
-      _candidateFilter,
-      playerFilter: _playerFilter,
-      rimFilter: _rimFilter,
-      segmentFilter: _segmentFilter,
-    );
-    final index = candidates.indexWhere(
-      (candidate) => candidate['id']?.toString() == id,
-    );
-    if (index < 0) return;
     final position = _candidateScrollController.position;
     unawaited(
       _candidateScrollController.animateTo(
@@ -1411,9 +1490,27 @@ class _TextEntryDialogState extends State<_TextEntryDialog> {
   late final TextEditingController _controller = TextEditingController(
     text: widget.initialText,
   );
+  late final FocusNode _focusNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode = FocusNode()..addListener(_logFocus);
+    appLog('info', 'input', '${widget.title} 打开');
+  }
+
+  void _logFocus() {
+    appLog(
+      'info',
+      'input',
+      '${widget.title} ${_focusNode.hasFocus ? '获得焦点' : '失去焦点'}',
+    );
+  }
 
   @override
   void dispose() {
+    _focusNode.removeListener(_logFocus);
+    _focusNode.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -1435,6 +1532,7 @@ class _TextEntryDialogState extends State<_TextEntryDialog> {
       title: Text(widget.title),
       content: TextField(
         controller: _controller,
+        focusNode: _focusNode,
         autofocus: true,
         maxLines: widget.maxLines,
         decoration: InputDecoration(
@@ -1557,14 +1655,15 @@ class _VideoPaneState extends ConsumerState<_VideoPane> {
   int _mediaGeneration = 0;
   bool _disposed = false;
   Future<void> _mediaQueue = Future<void>.value();
+  Completer<void>? _mediaReadinessCancellation;
   int _playbackToken = 0;
   Timer? _annotationHintTimer;
+  Timer? _readyWatch;
 
   @override
   void initState() {
     super.initState();
     widget.controller._attach(this);
-    _playback.register(this, _pauseForDialog);
     _clipEndMs = reviewTimelineBounds(
       isOriginalVideo: widget.isOriginalVideo,
       candidate: widget.candidate,
@@ -1580,7 +1679,7 @@ class _VideoPaneState extends ConsumerState<_VideoPane> {
     if (_player == null || _controller == null) {
       try {
         MediaKit.ensureInitialized();
-        _player ??= Player();
+        _player ??= createLoggedPlayer('审核页');
         _controller = VideoController(
           _player!,
           configuration: VideoControllerConfiguration(
@@ -1588,6 +1687,7 @@ class _VideoPaneState extends ConsumerState<_VideoPane> {
           ),
         );
       } catch (error) {
+        appLog('error', 'player', '播放器初始化失败: $error');
         _error = error.toString();
         return;
       }
@@ -1692,11 +1792,12 @@ class _VideoPaneState extends ConsumerState<_VideoPane> {
   @override
   void dispose() {
     widget.controller._detach(this);
-    _playback.unregister(this);
     _disposed = true;
+    _cancelMediaReadiness();
     _mediaGeneration++;
     _playbackToken++;
     _annotationHintTimer?.cancel();
+    _readyWatch?.cancel();
     final subscription = _positionSubscription;
     _positionSubscription = null;
     unawaited(_playingSubscription?.cancel());
@@ -1711,10 +1812,10 @@ class _VideoPaneState extends ConsumerState<_VideoPane> {
           // 此时 Video 组件已卸载、纹理不再渲染,销毁是安全的。
           try {
             await player.stop();
-          } catch (_) {}
+          } catch (error) { appLog('warn', 'review_screen', 'dispose 忽略了错误: $error'); }
           try {
-            await player.dispose();
-          } catch (_) {}
+            await disposeLoggedPlayer(player, '审核页');
+          } catch (error) { appLog('warn', 'review_screen', 'dispose 忽略了错误: $error'); }
         }),
       );
     }
@@ -1726,6 +1827,7 @@ class _VideoPaneState extends ConsumerState<_VideoPane> {
     bool playAfterOpen = false,
     bool recreatePlayer = false,
   }) {
+    _cancelMediaReadiness();
     final generation = ++_mediaGeneration;
     _playbackToken++;
     return _enqueueMediaAction(() async {
@@ -1747,12 +1849,20 @@ class _VideoPaneState extends ConsumerState<_VideoPane> {
         if (player != null) {
           try {
             await player.stop();
-          } catch (_) {}
+          } catch (error) { appLog('warn', 'review_screen', '_queueOpen 忽略了错误: $error'); }
         }
       }
       if (!_isCurrent(generation)) return;
       await _open(path, generation, playAfterOpen: playAfterOpen);
     });
+  }
+
+  void _cancelMediaReadiness() {
+    final cancellation = _mediaReadinessCancellation;
+    _mediaReadinessCancellation = null;
+    if (cancellation != null && !cancellation.isCompleted) {
+      cancellation.complete();
+    }
   }
 
   void _reloadVideo() {
@@ -1838,12 +1948,34 @@ class _VideoPaneState extends ConsumerState<_VideoPane> {
         return;
       }
       await matchPlayerToSourceRotation(player, rotation: widget.rotation);
-      await player.open(Media(Uri.file(path).toString()), play: false);
-      if (!_isCurrent(generation)) return;
-      await waitForPlayableDuration(
-        current: player.state.duration,
-        updates: player.stream.duration,
+      await openLoggedMedia(
+        player,
+        '审核页',
+        path,
+        video: ref.read(projectProvider).video,
       );
+      if (!_isCurrent(generation)) return;
+      final readyWatch = _readyWatch = watchPlayerReadyTimeout('审核页');
+      final cancellation = _mediaReadinessCancellation = Completer<void>();
+      try {
+        await waitForPlayableDuration(
+          current: player.state.duration,
+          updates: player.stream.duration,
+          cancelled: cancellation.future,
+        );
+      } on MediaReadinessCancelled {
+        return;
+      } on Object catch (error) {
+        appLog('warn', 'player', '审核页 等待视频就绪失败: $error');
+        rethrow;
+      } finally {
+        if (identical(_mediaReadinessCancellation, cancellation)) {
+          _mediaReadinessCancellation = null;
+        }
+        if (!cancellation.isCompleted) cancellation.complete();
+        readyWatch.cancel();
+        if (identical(_readyWatch, readyWatch)) _readyWatch = null;
+      }
       if (!_isCurrent(generation)) return;
       setState(() {
         _ready = true;
@@ -1907,6 +2039,7 @@ class _VideoPaneState extends ConsumerState<_VideoPane> {
       if (!_isCurrent(generation, playbackToken: playbackToken)) return;
       await player.play();
     } catch (error) {
+      appLog('error', 'player', '审核页 播放片段失败: $error');
       if (_isCurrent(generation)) {
         setState(() => _error = error.toString());
       }
@@ -1938,6 +2071,7 @@ class _VideoPaneState extends ConsumerState<_VideoPane> {
       await player.pause();
       await player.seek(Duration(milliseconds: start));
     } catch (error) {
+      appLog('error', 'player', '审核页 seek 失败 start=${start}ms: $error');
       if (_isCurrent(generation)) {
         setState(() => _error = error.toString());
       }
@@ -1945,6 +2079,10 @@ class _VideoPaneState extends ConsumerState<_VideoPane> {
   }
 
   int get currentPositionMs => _player?.state.position.inMilliseconds ?? 0;
+
+  Future<void> pausePlayback() => _enqueueMediaAction(() async {
+    if (mounted && !_disposed) await _player?.pause();
+  });
 
   Future<void> togglePlayPause() async {
     if (!_mayPlay) return;
@@ -2215,6 +2353,12 @@ class _VideoPaneController {
 
   int get currentPositionMs => _state?.currentPositionMs ?? 0;
 
+  int? get playingPositionMs => _state?._player?.state.playing == true
+      ? _state!.currentPositionMs
+      : null;
+
+  Future<void> pause() => _state?.pausePlayback() ?? Future.value();
+
   void _attach(_VideoPaneState state) => _state = state;
 
   void _detach(_VideoPaneState state) {
@@ -2431,7 +2575,9 @@ class _VideoSourceToggle extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
-    return Tooltip(
+    return KeyedSubtree(
+      key: _reviewGuideSourceKey,
+      child: Tooltip(
       message: context.bheText('切换视频来源'),
       child: Material(
         color: c.background.withValues(alpha: 0.88),
@@ -2456,6 +2602,7 @@ class _VideoSourceToggle extends StatelessWidget {
             ],
           ),
         ),
+      ),
       ),
     );
   }
@@ -2847,6 +2994,14 @@ class _VideoControlsState extends State<_VideoControls> {
                   enabled: widget.annotationsEnabled,
                   onChanged: widget.onToggleAnnotations!,
                 ),
+              // 还没有播放器时也保留音量控制，控制条布局不会跳。
+              ReviewVolumeControls(
+                enabled: widget.enabled,
+                colors: c,
+                labelStyle: theme.textTheme.labelSmall?.copyWith(
+                  color: c.textSecondary,
+                ),
+              ),
             ],
           ),
         ),
@@ -3046,6 +3201,11 @@ class _VideoControlsState extends State<_VideoControls> {
                 onChanged: widget.onToggleAnnotations!,
               ),
             ],
+            ReviewVolumeControls(
+              enabled: widget.enabled,
+              colors: c,
+              labelStyle: labelStyle,
+            ),
             StreamBuilder<double>(
               stream: player.stream.rate,
               initialData: player.state.rate,
@@ -3311,21 +3471,27 @@ class _CandidateInspector extends StatelessWidget {
           runSpacing: 6,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
-            _PlayerChip(
-              key: const ValueKey('inspector-player-chip'),
-              name: candidate['player_name']?.toString(),
-              color: playerColor,
-              players: players,
-              onSelected: onSetPlayer,
-              onCreate: onCreatePlayer,
-              onDelete: onDeletePlayer,
+            KeyedSubtree(
+              key: _reviewGuideTagKey,
+              child: _PlayerChip(
+                key: const ValueKey('inspector-player-chip'),
+                name: candidate['player_name']?.toString(),
+                color: playerColor,
+                players: players,
+                onSelected: onSetPlayer,
+                onCreate: onCreatePlayer,
+                onDelete: onDeletePlayer,
+              ),
             ),
-            Tooltip(
-              message: context.bheText('调整片段范围'),
-              child: _InspectorAction(
-                icon: Icons.tune_rounded,
-                label: l10n?.reviewAdjustRange ?? '调整范围',
-                onPressed: onEditRange,
+            KeyedSubtree(
+              key: _reviewGuideRangeKey,
+              child: Tooltip(
+                message: context.bheText('调整片段范围'),
+                child: _InspectorAction(
+                  icon: Icons.tune_rounded,
+                  label: l10n?.reviewAdjustRange ?? '调整范围',
+                  onPressed: onEditRange,
+                ),
               ),
             ),
             Tooltip(
@@ -3807,6 +3973,7 @@ class _InspectorDecision extends StatelessWidget {
 class _ClipRangeDialog extends StatefulWidget {
   const _ClipRangeDialog({
     required this.videoPath,
+    this.video,
     required this.frameSize,
     this.rotation = 0,
     required this.startMs,
@@ -3821,6 +3988,7 @@ class _ClipRangeDialog extends StatefulWidget {
   });
 
   final String? videoPath;
+  final JsonMap? video;
   final Size frameSize;
   final int rotation;
   final int startMs;
@@ -3838,6 +4006,7 @@ class _ClipRangeDialog extends StatefulWidget {
 }
 
 class _ClipRangeDialogState extends State<_ClipRangeDialog> {
+  final _mediaReadinessCancellation = Completer<void>();
   Player? _player;
   VideoController? _controller;
   StreamSubscription<Duration>? _positionSubscription;
@@ -3894,7 +4063,7 @@ class _ClipRangeDialogState extends State<_ClipRangeDialog> {
     }
     try {
       MediaKit.ensureInitialized();
-      final player = Player();
+      final player = createLoggedPlayer('范围编辑');
       _player = player;
       _controller = VideoController(
         player,
@@ -3926,13 +4095,16 @@ class _ClipRangeDialogState extends State<_ClipRangeDialog> {
         }
       });
       await matchPlayerToSourceRotation(player, rotation: widget.rotation);
-      await player.open(Media(Uri.file(path).toString()), play: false);
+      await openLoggedMedia(player, '审核页', path, video: widget.video);
+      if (!mounted || !identical(player, _player)) return;
       // 等媒体元数据就绪后再 seek:open 后立即 seek 在加载较慢时
       // (Windows 软件解码)会被丢弃,导致播放从 0 开始而非片段起点。
       await waitForPlayableDuration(
         current: player.state.duration,
         updates: player.stream.duration,
+        cancelled: _mediaReadinessCancellation.future,
       );
+      if (!mounted || !identical(player, _player)) return;
       await player.seek(Duration(milliseconds: _startMs));
       if (mounted && identical(player, _player)) {
         setState(() => _ready = true);
@@ -3944,6 +4116,7 @@ class _ClipRangeDialogState extends State<_ClipRangeDialog> {
 
   @override
   void dispose() {
+    _mediaReadinessCancellation.complete();
     unawaited(_positionSubscription?.cancel());
     unawaited(_playingSubscription?.cancel());
     _scrubTimer?.cancel();
@@ -3954,10 +4127,10 @@ class _ClipRangeDialogState extends State<_ClipRangeDialog> {
       if (player == null) return;
       try {
         await player.stop();
-      } catch (_) {}
+      } catch (error) { appLog('warn', 'review_screen', 'dispose 忽略了错误: $error'); }
       try {
-        await player.dispose();
-      } catch (_) {}
+        await disposeLoggedPlayer(player, '范围编辑');
+      } catch (error) { appLog('warn', 'review_screen', 'dispose 忽略了错误: $error'); }
     }());
     _startController.dispose();
     _endController.dispose();
@@ -4144,9 +4317,9 @@ class _ClipRangeDialogState extends State<_ClipRangeDialog> {
     final key = event.logicalKey;
     if (key == LogicalKeyboardKey.space) {
       unawaited(_togglePlayback());
-    } else if (key == LogicalKeyboardKey.keyI) {
+    } else if (key == rangeSetStartKey) {
       _setHandleAtPosition(ClipRangeHandle.start);
-    } else if (key == LogicalKeyboardKey.keyO) {
+    } else if (key == rangeSetEndKey) {
       _setHandleAtPosition(ClipRangeHandle.end);
     } else if (key == LogicalKeyboardKey.arrowLeft) {
       _finishScrub(_positionMs - 1000);
@@ -4859,16 +5032,18 @@ class _CandidatePanel extends StatelessWidget {
                     ),
                   ),
                 const Spacer(),
-                IconButton(
-                  tooltip: context.bheText('批量设置片段时长'),
-                  onPressed: busy ? null : onBatchRange,
-                  icon: const Icon(Icons.schedule_outlined, size: 18),
-                  visualDensity: VisualDensity.compact,
+                KeyedSubtree(
+                  key: _reviewGuideBatchKey,
+                  child: IconButton(
+                    tooltip: context.bheText('批量设置片段时长'),
+                    onPressed: busy ? null : onBatchRange,
+                    icon: const Icon(Icons.schedule_outlined, size: 18),
+                    visualDensity: VisualDensity.compact,
+                  ),
                 ),
                 Tooltip(
-                  message: context.bheText(
-                    '快捷键\nSpace  播放/暂停\nL  循环当前\nA  显示/关闭标注\n↑ / ↓  切换候选\n← / →  快退/快进 2 秒 · 加 Shift 每次 0.1 秒\nC / Enter  保留\nX / ` / Backspace  排除\n1–9、Q–P  设置球员标签 · 0  清除\nCmd/Ctrl+Z  撤销',
-                  ),
+                  message:
+                      '${context.bheText('快捷键')}\n${reviewShortcutGuideText(context)}',
                   child: Padding(
                     padding: const EdgeInsets.all(8),
                     child: Icon(
@@ -4936,11 +5111,14 @@ class _CandidatePanel extends StatelessWidget {
             ),
           ],
           const SizedBox(height: Spacing.sm),
-          _StatusSegments(
-            value: filter,
-            total: totalCount,
-            included: includedCount,
-            onChanged: onFilterChanged,
+          KeyedSubtree(
+            key: _reviewGuideFilterKey,
+            child: _StatusSegments(
+              value: filter,
+              total: totalCount,
+              included: includedCount,
+              onChanged: onFilterChanged,
+            ),
           ),
           const SizedBox(height: Spacing.sm),
           _PlayerTagChips(
@@ -5102,6 +5280,8 @@ class _CandidatePanel extends StatelessWidget {
                   const SizedBox(width: Spacing.sm),
                   Flexible(
                     flex: 2,
+                    child: KeyedSubtree(
+                    key: _reviewGuideMissedKey,
                     child: Tooltip(
                     message: context.bheText('从原视频当前时间补漏候选'),
                     child: OutlinedButton.icon(
@@ -5118,6 +5298,7 @@ class _CandidatePanel extends StatelessWidget {
                         side: BorderSide(color: c.borderStrong),
                         minimumSize: const Size(0, 40),
                       ),
+                    ),
                     ),
                     ),
                   ),
@@ -7266,4 +7447,93 @@ String _formatEstimatedRemaining(String? startedAt, double progress) {
   final remainingMs = (elapsed.inMilliseconds * (1 - progress) / progress)
       .round();
   return _formatDuration(Duration(milliseconds: remainingMs));
+}
+
+/// 播放控制条里的音量控制：静音按钮（喇叭/划线喇叭）+ 紧凑音量滑块。
+///
+/// 拖动中实时生效，只在松手时记一条日志，避免刷屏。
+class ReviewVolumeControls extends StatelessWidget {
+  const ReviewVolumeControls({
+    super.key,
+    required this.enabled,
+    required this.colors,
+    this.labelStyle,
+  });
+
+  final bool enabled;
+  final AppColors colors;
+  final TextStyle? labelStyle;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: playerAudioSettings,
+      builder: (context, _) {
+        final settings = playerAudioSettings;
+        final muted = settings.muted;
+        final volume = settings.volume;
+        final percent = muted ? 0 : volume;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              key: const Key('review-volume-mute'),
+              tooltip: context.bheText(muted ? '取消静音' : '静音'),
+              onPressed: enabled ? settings.toggleMute : null,
+              iconSize: 18,
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              icon: Icon(
+                muted ? Icons.volume_off : Icons.volume_up,
+                color: enabled ? colors.textSecondary : colors.textTertiary,
+              ),
+            ),
+            SizedBox(
+              width: 84,
+              child: SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 2,
+                  thumbShape: const RoundSliderThumbShape(
+                    enabledThumbRadius: 5,
+                  ),
+                  overlayShape: const RoundSliderOverlayShape(
+                    overlayRadius: 10,
+                  ),
+                ),
+                child: Slider(
+                  key: const Key('review-volume-slider'),
+                  value: percent.toDouble(),
+                  max: 100,
+                  divisions: 20,
+                  activeColor: colors.orange,
+                  inactiveColor: colors.border,
+                  label: context.bheText('音量 $percent%'),
+                  onChanged: enabled
+                      ? (value) => settings.setVolume(value.round())
+                      : null,
+                  onChangeEnd: enabled
+                      ? (value) => appLog(
+                          'info',
+                          'player',
+                          '音量拖动结束 ${value.round()}%',
+                        )
+                      : null,
+                ),
+              ),
+            ),
+            SizedBox(
+              width: 34,
+              child: Text(
+                '$percent%',
+                style: labelStyle?.copyWith(
+                  color: enabled ? colors.textSecondary : colors.textTertiary,
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
 }

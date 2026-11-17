@@ -103,10 +103,26 @@ class MergeMediaFinalizerTest {
         }
     }
     @Test fun unlocatableOrVideolessIntervalIsDistinguished() {
-        assertThrows(MergeRangeUnavailable::class.java) { MergeMediaFinalizer.requireLocation(-1) }
+        assertThrows(MergeRangeUnavailable::class.java) {
+            MergeMediaFinalizer.requireLocation(NO_SAMPLE_TIME, -1)
+        }
         assertThrows(MergeRangeUnavailable::class.java) { MergeMediaFinalizer.requireVideoSamples(0) }
-        MergeMediaFinalizer.requireLocation(0)
+        MergeMediaFinalizer.requireLocation(0, 0)
         MergeMediaFinalizer.requireVideoSamples(1)
     }
 
+    @Test fun negativeStartPtsIsAValidLocation() {
+        // 手机录制常见：首个样本 PTS 是负数（如 -1,000,000µs），不是「没有样本」。
+        MergeMediaFinalizer.requireLocation(-1_000_000L, 0)
+        MergeMediaFinalizer.requireLocation(-33_333L, 3)
+    }
+
+    @Test fun extraVideoTrackInOutputIsReportedInsteadOfGuessed() {
+        MergeMediaFinalizer.requireSingleVideoTrack(1)
+        MergeMediaFinalizer.requireSingleVideoTrack(0)
+        val error = assertThrows(IllegalStateException::class.java) {
+            MergeMediaFinalizer.requireSingleVideoTrack(3)
+        }
+        assertTrue(error.message!!.contains("多条视频轨"))
+    }
 }

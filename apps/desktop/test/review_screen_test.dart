@@ -4,16 +4,30 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'dart:convert';
 import 'dart:async';
+import 'dart:io';
+import 'dart:ui' as ui;
+import 'package:flutter/rendering.dart';
 import 'package:bhe_l10n/bhe_l10n.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:desktop/features/review/review_screen.dart';
 import 'package:desktop/components/cs_progress_track.dart';
+import 'package:desktop/core/player_audio_settings.dart';
 import 'package:desktop/features/review/media_readiness.dart';
+import 'package:desktop/features/review/review_shortcuts.dart';
+import 'package:desktop/providers/onboarding_provider.dart';
 import 'package:desktop/providers/project_state.dart';
+import 'package:desktop/theme/app_colors.dart';
 import 'package:desktop/theme/tokens.dart';
+import 'package:desktop/theme/app_theme.dart';
 
 void main() {
+  // 默认当作已看过引导，免得遮罩挡住别的用例；引导本身在 onboarding_test 里测。
+  setUp(
+    () => SharedPreferences.setMockInitialValues({
+      onboardingStepsPrefsKey: allOnboardingStepIds,
+    }),
+  );
   for (final language in ['zh', 'en']) {
     testWidgets('preflight stage and percentages stay consistent $language', (
       tester,
@@ -685,6 +699,44 @@ void main() {
     expect(duration, const Duration(seconds: 9));
   });
 
+  test('元数据迟到时通过重试拿到时长(NAS 慢盘场景)', () async {
+    final controller = StreamController<Duration>.broadcast();
+    final expectation = expectLater(
+      waitForPlayableDuration(
+        current: Duration.zero,
+        updates: controller.stream,
+        timeout: const Duration(milliseconds: 80),
+        retries: 2,
+      ),
+      completion(const Duration(seconds: 30)),
+    );
+    // 第一次尝试超时后才补发时长:验证重试会重新订阅并接受迟到的值。
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+    controller.add(const Duration(seconds: 30));
+    await expectation;
+    await controller.close();
+  });
+
+  test('重试耗尽后抛出带原因的友好超时异常', () async {
+    final controller = StreamController<Duration>.broadcast();
+    await expectLater(
+      waitForPlayableDuration(
+        current: Duration.zero,
+        updates: controller.stream,
+        timeout: const Duration(milliseconds: 60),
+        retries: 1,
+      ),
+      throwsA(
+        isA<MediaReadinessTimeout>().having(
+          (error) => error.toString(),
+          'message',
+          contains('NAS'),
+        ),
+      ),
+    );
+    await controller.close();
+  });
+
   testWidgets(
     'shows analysis progress instead of an unexplained waiting state',
     (tester) async {
@@ -817,6 +869,91 @@ void main() {
 
     expect(find.text('快速分析未找到候选 · 可能漏检'), findsOneWidget);
     expect(find.text('用标准模式重新分析', skipOffstage: false), findsOneWidget);
+  });
+
+  testWidgets('审核页控制条里有静音按钮与音量滑块', (tester) async {
+    await playerAudioSettings.load();
+    await playerAudioSettings.reset();
+    await _pumpReview(
+      tester,
+      const ProjectState(
+        job: {'state': 'completed'},
+        candidates: [
+          {
+            'id': 'candidate-1',
+            'event_time_ms': 12000,
+            'default_start_ms': 6000,
+            'default_end_ms': 15000,
+          },
+        ],
+      ),
+    );
+
+    expect(find.byKey(const Key('review-volume-mute')), findsOneWidget);
+    expect(find.byKey(const Key('review-volume-slider')), findsOneWidget);
+  });
+
+  testWidgets('音量控制：点静音变划线喇叭、再点恢复，记住的音量不变', (
+    tester,
+  ) async {
+    await playerAudioSettings.load();
+    await playerAudioSettings.reset();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: ReviewVolumeControls(
+              enabled: true,
+              colors: darkAppColors,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byIcon(Icons.volume_up), findsOneWidget);
+    await tester.tap(find.byKey(const Key('review-volume-mute')));
+    await tester.pump();
+    expect(find.byIcon(Icons.volume_off), findsOneWidget);
+    expect(playerAudioSettings.muted, isTrue);
+    expect(playerAudioSettings.volume, 100, reason: '静音不改记住的音量');
+
+    await tester.tap(find.byKey(const Key('review-volume-mute')));
+    await tester.pump();
+    expect(find.byIcon(Icons.volume_up), findsOneWidget);
+    expect(playerAudioSettings.muted, isFalse);
+  });
+
+  testWidgets('静音中按 = 从记住的音量加 10 并自动取消静音', (tester) async {
+    await playerAudioSettings.load();
+    await playerAudioSettings.reset();
+    playerAudioSettings.setVolume(60);
+    playerAudioSettings.setMuted(true);
+    expect(playerAudioSettings.effectiveVolume, 0);
+
+    await _pumpReview(
+      tester,
+      const ProjectState(
+        job: {'state': 'completed'},
+        candidates: [
+          {
+            'id': 'candidate-1',
+            'event_time_ms': 12000,
+            'default_start_ms': 6000,
+            'default_end_ms': 15000,
+          },
+        ],
+      ),
+    );
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.equal);
+    await tester.pump();
+    expect(playerAudioSettings.muted, isFalse);
+    expect(playerAudioSettings.volume, 70, reason: '从 60 加 10，不是从 0');
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.minus);
+    await tester.pump();
+    expect(playerAudioSettings.volume, 60);
   });
 
   testWidgets('keeps review status and action areas inset from the edges', (
@@ -1280,6 +1417,36 @@ void main() {
     expect(find.byTooltip('切换视频来源'), findsOneWidget);
   });
 
+  testWidgets('review page shows the onboarding guide on first visit only', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    await _pumpReview(
+      tester,
+      const ProjectState(
+        job: {'state': 'completed'},
+        video: {'id': 'v1', 'source_path': '/v/a.mp4', 'duration_ms': 300000},
+        videoPath: '/v/a.mp4',
+        candidates: [
+          {
+            'id': 'candidate-1',
+            'video_id': 'v1',
+            'event_time_ms': 12000,
+            'default_start_ms': 9000,
+            'default_end_ms': 13000,
+          },
+        ],
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+    expect(find.byKey(const Key('onboarding-overlay')), findsOneWidget);
+    expect(find.text('这里看视频'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('onboarding-skip')));
+    await tester.pump();
+    expect(find.byKey(const Key('onboarding-overlay')), findsNothing);
+  });
+
   testWidgets('multi-part review can switch to the original video after import', (
     tester,
   ) async {
@@ -1619,12 +1786,15 @@ void main() {
       ),
     );
 
-    expect(
-      find.byTooltip(
-        '快捷键\nSpace  播放/暂停\nL  循环当前\nA  显示/关闭标注\n↑ / ↓  切换候选\n← / →  快退/快进 2 秒 · 加 Shift 每次 0.1 秒\nC / Enter  保留\nX / ` / Backspace  排除\n1–9、Q–P  设置球员标签 · 0  清除\nCmd/Ctrl+Z  撤销',
-      ),
-      findsOneWidget,
-    );
+    // 提示文字来自快捷键表，不是手写的；这里核对它列全了表里的每个动作。
+    final tooltip = tester
+        .widgetList<Tooltip>(find.byType(Tooltip))
+        .firstWhere((tip) => (tip.message ?? '').startsWith('快捷键\n'));
+    final message = tooltip.message!;
+    for (final shortcut in reviewShortcuts) {
+      expect(message, contains(shortcut.label), reason: shortcut.label);
+    }
+    expect(message, contains('1–9、Q–P'));
   });
 
   testWidgets('routes review shortcuts through the workspace focus node', (
@@ -1659,6 +1829,70 @@ void main() {
     await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
     await tester.pump();
     expect(find.text('候选 00:12'), findsOneWidget);
+  });
+
+  testWidgets('queued filter scroll is safe after rapid switch to empty', (tester) async {
+    await _pumpReview(tester, ProjectState(
+      job: const {'state': 'completed'},
+      candidates: [for (var i = 0; i < 5; i++) {
+        'id': 'empty-$i', 'event_time_ms': i * 2000,
+        'default_start_ms': i * 2000, 'default_end_ms': i * 2000 + 1000,
+        'review_status': 'pending',
+      }],
+    ));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('review-status-included')));
+    await tester.tap(find.byKey(const ValueKey('review-status-excluded')));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(find.byKey(const ValueKey('candidate-row-empty-0')), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('review-status-all')));
+    await tester.pumpAndSettle();
+    expect(find.text('候选 00:00'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('filter switch keeps nearest clip and earlier tie visible', (tester) async {
+    const font = String.fromEnvironment('BHE_SCREENSHOT_FONT');
+    if (font.isNotEmpty) {
+      await tester.runAsync(() async {
+        final bytes = await File(font).readAsBytes();
+        for (final family in ['Roboto', 'Inter']) {
+          await (FontLoader(family)..addFont(Future.value(ByteData.sublistView(bytes)))).load();
+        }
+      });
+    }
+    await _pumpReview(tester, ProjectState(
+      job: const {'state': 'completed'},
+      candidates: [for (var i = 0; i < 21; i++) {
+        'id': 'position-$i', 'event_time_ms': i * 2000,
+        'default_start_ms': i * 2000, 'default_end_ms': i * 2000 + 1000,
+        'review_status': i.isOdd ? 'excluded' : 'pending',
+      }],
+    ), locale: const Locale('en'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('review-status-included')));
+    await tester.pumpAndSettle();
+    final last = find.byKey(const ValueKey('candidate-row-position-20'));
+    await tester.scrollUntilVisible(last, 400, scrollable: find.byType(Scrollable).last);
+    await tester.tap(last);
+    await tester.pumpAndSettle();
+    expect(find.text('Candidate 00:40'), findsOneWidget);
+    await _saveFilterPositionEvidence(tester, 'before-included-40s');
+    await tester.tap(find.byKey(const ValueKey('review-status-excluded')));
+    await tester.pumpAndSettle();
+    expect(find.text('Candidate 00:38'), findsOneWidget);
+    final nearest = find.byKey(const ValueKey('candidate-row-position-19'));
+    expect(nearest.hitTestable(), findsOneWidget);
+    await _saveFilterPositionEvidence(tester, 'after-excluded-38s');
+    await tester.tap(find.byKey(const ValueKey('review-status-all')));
+    await tester.pumpAndSettle();
+    expect(find.text('Candidate 00:38'), findsOneWidget);
+    expect(nearest.hitTestable(), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('review-status-included')));
+    await tester.pumpAndSettle();
+    expect(find.text('Candidate 00:36'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('filters candidates without changing their chronological order', (
@@ -1886,6 +2120,46 @@ void main() {
 
     expect(notifier.maxConcurrentPreviewLoads, lessThanOrEqualTo(2));
   });
+
+  // D-L057 a)：一进审核页到底会发多少个取封面请求、会不会重复发同一个。
+  testWidgets('首屏每个候选各发一次取封面，不重复发同一帧', (tester) async {
+    final notifier = _PreviewTrackingNotifier(
+      ProjectState(
+        video: const {'id': 'video-1'},
+        job: const {'state': 'completed'},
+        candidates: List.generate(
+          20,
+          (index) => {
+            'id': 'candidate-$index',
+            'event_time_ms': index * 3000,
+            'default_start_ms': index * 3000,
+            'default_end_ms': index * 3000 + 3000,
+          },
+        ),
+      ),
+    );
+    await _pumpReview(
+      tester,
+      notifier.initialState,
+      notifier: notifier,
+      size: const Size(1440, 900),
+    );
+    await tester.pump(const Duration(seconds: 1));
+
+    final requests = notifier.previewRequests;
+    expect(requests, isNotEmpty);
+    expect(
+      requests.length,
+      lessThan(20),
+      reason: '只有首屏可见的候选才会请求封面（不是全部 20 个）',
+    );
+    expect(
+      requests.toSet().length,
+      requests.length,
+      reason: '同一个候选同一时刻只发一次（_coverCache 去重）',
+    );
+    expect(notifier.sawDuplicateInFlight, isFalse);
+  });
 }
 
 Future<void> _pumpReview(
@@ -1904,6 +2178,7 @@ Future<void> _pumpReview(
         projectProvider.overrideWith(() => notifier ?? _ReviewNotifier(state)),
       ],
       child: MaterialApp(
+        theme: const String.fromEnvironment('BHE_FILTER_SCREENSHOTS').isEmpty ? null : appTheme(Brightness.dark),
         locale: locale,
         localizationsDelegates: locale == null
             ? null
@@ -2074,14 +2349,21 @@ class _PreviewTrackingNotifier extends _ReviewNotifier {
 
   int activePreviewLoads = 0;
   int maxConcurrentPreviewLoads = 0;
+  final List<String> previewRequests = <String>[];
+  final Set<String> inFlightPreviewKeys = <String>{};
+  bool sawDuplicateInFlight = false;
 
   @override
   Future<String?> loadCandidatePreview(String candidateId, int timeMs) async {
+    previewRequests.add('$candidateId:$timeMs');
+    final key = '$candidateId:$timeMs';
+    if (!inFlightPreviewKeys.add(key)) sawDuplicateInFlight = true;
     activePreviewLoads++;
     if (activePreviewLoads > maxConcurrentPreviewLoads) {
       maxConcurrentPreviewLoads = activePreviewLoads;
     }
     await Future<void>.delayed(const Duration(milliseconds: 20));
+    inFlightPreviewKeys.remove(key);
     activePreviewLoads--;
     return null;
   }
@@ -2114,4 +2396,18 @@ class _PlayerLayoutNotifier extends _ReviewNotifier {
       ],
     );
   }
+}
+
+Future<void> _saveFilterPositionEvidence(WidgetTester tester, String name) async {
+  const directory = String.fromEnvironment('BHE_FILTER_SCREENSHOTS');
+  if (directory.isEmpty) return;
+  final boundary = tester.renderObject<RenderRepaintBoundary>(find.byType(RepaintBoundary).first);
+  await tester.runAsync(() async {
+    final image = await boundary.toImage(pixelRatio: 1);
+    final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+    final file = File('$directory/desktop-$name.png');
+    await file.parent.create(recursive: true);
+    await file.writeAsBytes(bytes!.buffer.asUint8List());
+    image.dispose();
+  });
 }

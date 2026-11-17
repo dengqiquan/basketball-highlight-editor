@@ -35,8 +35,23 @@ FriendlyMobileError friendlyMobileError(
       raw.contains('分析已取消')) {
     return const FriendlyMobileError(null, cancelled: true);
   }
+  if (code == 'ALREADY_ACTIVE' || raw.contains('already_active')) {
+    return const FriendlyMobileError(
+      '系统文件选择窗口还在占用，请稍等几秒再试；如果一直这样，请完全退出 App 后重新打开。',
+    );
+  }
   if (raw.contains('上一次导出尚未结束')) {
     return const FriendlyMobileError('上一次导出尚未结束，请稍后重试。');
+  }
+  if (operation == 'gallery.save' &&
+      (code == 'PHOTO_PERMISSION_DENIED' ||
+          errno == 13 ||
+          errno == 1 ||
+          raw.contains('permission denied') ||
+          raw.contains('eacces') ||
+          raw.contains('eperm') ||
+          raw.contains('securityexception'))) {
+    return const FriendlyMobileError('没有相册保存权限，请在系统设置中允许 BHE 添加照片。');
   }
   if (errno == 28 ||
       raw.contains('enospc') ||
@@ -95,6 +110,8 @@ FriendlyMobileError friendlyMobileError(
   return FriendlyMobileError(switch (operation.split('.').first) {
     'analysis' => '出错了：视频分析未完成，请重试。',
     'export' => '出错了：视频导出未完成，请重试。',
+    'share' => '无法打开分享面板，请重试。',
+    'gallery' => '无法保存到相册，请重试。',
     'update' => '出错了：更新操作未完成，请重试。',
     _ => '出错了：操作未完成，请重试。',
   });

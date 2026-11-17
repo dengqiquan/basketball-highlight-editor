@@ -28,6 +28,7 @@ import 'features/game_stats/game_stats.dart';
 
 export 'mobile_theme.dart' show BhePalette, bheTheme;
 
+part 'features/toast/bhe_toast.dart';
 part 'features/video_source/video_source_notice.dart';
 part 'features/diagnostics/diagnostic_sheet.dart';
 part 'features/video_source/review_video_source.dart';
@@ -67,6 +68,8 @@ class _BheMobileAppState extends State<BheMobileApp> {
   final _navigatorKey = GlobalKey<NavigatorState>();
   final _messengerKey = GlobalKey<ScaffoldMessengerState>();
   Timer? _updateCheckTimer;
+  Timer? _closeNoticeTimer;
+  bool _showCloseNotice = false;
   _WorkspaceSection section = _WorkspaceSection.project;
   bool dark = true;
   Locale _locale = BheLocale.fromSystem(
@@ -78,6 +81,7 @@ class _BheMobileAppState extends State<BheMobileApp> {
   bool _wasExporting = false;
   bool _starPromptHandled = false;
   String? _lastHistoryWarning;
+  String? _lastGallerySaveNotice;
 
   @override
   void initState() {
@@ -98,6 +102,10 @@ class _BheMobileAppState extends State<BheMobileApp> {
       SnackBar(
         content: Text(context.bheText('发现新版本 v$version')),
         behavior: SnackBarBehavior.floating,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.all(Radius.circular(12)),
+        ),
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
         duration: const Duration(seconds: 8),
         action: SnackBarAction(
           label: context.bheText('查看'),
@@ -144,7 +152,30 @@ class _BheMobileAppState extends State<BheMobileApp> {
   }
 
   void _handleStateChange() {
+    if (state.projectTransitioning && state.closingProject) {
+      _closeNoticeTimer ??= Timer(const Duration(milliseconds: 600), () {
+        if (mounted && state.projectTransitioning && state.closingProject) {
+          setState(() => _showCloseNotice = true);
+        }
+      });
+    } else {
+      _closeNoticeTimer?.cancel();
+      _closeNoticeTimer = null;
+      if (_showCloseNotice && mounted) setState(() => _showCloseNotice = false);
+    }
     final warning = state.exportHistoryWarning;
+    final gallerySaveNotice = state.gallerySaveNotice;
+    if (gallerySaveNotice != _lastGallerySaveNotice) {
+      _lastGallerySaveNotice = gallerySaveNotice;
+      if (gallerySaveNotice != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || state.gallerySaveNotice != gallerySaveNotice) return;
+          final context = _navigatorKey.currentContext;
+          if (context == null || !context.mounted) return;
+          showBheToast(context, context.bheText(gallerySaveNotice));
+        });
+      }
+    }
     if (warning != _lastHistoryWarning) {
       _lastHistoryWarning = warning;
       if (warning != null) {
@@ -155,20 +186,24 @@ class _BheMobileAppState extends State<BheMobileApp> {
           if (context == null || !context.mounted) return;
           _messengerKey.currentState?.showSnackBar(SnackBar(
             behavior: SnackBarBehavior.floating,
+            shape: const RoundedRectangleBorder(
+              borderRadius: BorderRadius.all(Radius.circular(12)),
+            ),
+            margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
             content: Text(context.bheText(warning)),
             action: SnackBarAction(label: context.bheText('反馈'), onPressed: () => showMobileDiagnostics(context, error: diagnostic)),
           ));
         });
       }
     }
-    final exportCompleted =
+    final gallerySaved =
         _wasExporting &&
         !state.exporting &&
         state.exportedPaths.isNotEmpty &&
         state.errorMessage == null &&
         !state.exportCancelled;
     _wasExporting = state.exporting;
-    if (exportCompleted) unawaited(_maybeShowStarPrompt());
+    if (gallerySaved) unawaited(_maybeShowStarPrompt());
 
     final projectChanged = state.project.id != _lastProjectId;
     if (projectChanged) {
@@ -255,6 +290,7 @@ class _BheMobileAppState extends State<BheMobileApp> {
   @override
   void dispose() {
     _updateCheckTimer?.cancel();
+    _closeNoticeTimer?.cancel();
     updater.dispose();
     state.removeListener(_handleStateChange);
     if (widget.appState == null) { state.dispose(); }
@@ -276,21 +312,15 @@ class _BheMobileAppState extends State<BheMobileApp> {
       return;
     }
     _lastBackPress = now;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          content: Text(
-            Localizations.of<BheLocalizations>(
-                  context,
-                  BheLocalizations,
-                )?.pressBackAgainToExit ??
-                '再按一次返回键退出 BHE',
-          ),
-          behavior: SnackBarBehavior.floating,
-          duration: Duration(seconds: 2),
-        ),
-      );
+    showBheToast(
+      context,
+      Localizations.of<BheLocalizations>(
+            context,
+            BheLocalizations,
+          )?.pressBackAgainToExit ??
+          '再按一次返回键退出 BHE',
+      duration: const Duration(seconds: 2),
+    );
   }
 
   @override
@@ -313,7 +343,7 @@ class _BheMobileAppState extends State<BheMobileApp> {
           absorbing: state.projectTransitioning,
           child: Opacity(opacity: state.projectTransitioning ? .55 : 1, child: child),
         ),
-        if (state.projectTransitioning)
+        if (state.projectTransitioning && (!state.closingProject || _showCloseNotice))
           Positioned(top: 0, left: 0, right: 0, child: SafeArea(
             child: Material(
               key: const ValueKey('project-transition-notice'),
@@ -502,24 +532,30 @@ class _TopBar extends StatelessWidget {
               ),
             ),
           ),
-          if (state.project.video != null || state.recentProjects.any((p) => p.id == state.project.id))
-            Flexible(
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 6),
-                child: InkWell(
-                  key: const ValueKey('project-name-rename'),
-                  onTap: section == _WorkspaceSection.project ? () => _showProjectRename(context, state) : null,
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
-                    child: Align(alignment: Alignment.centerRight, child: Text(
-                      state.project.name,
-                      overflow: TextOverflow.ellipsis,
-                      textAlign: TextAlign.right,
-                      style: Theme.of(context).textTheme.bodySmall,
-                    )),
-                  ),
-                ),
+          Flexible(
+            child: InkWell(
+              key: const ValueKey('project-name-rename'),
+              onTap: () => _showProjectActions(context, state),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Flexible(child: Text(
+                    state.project.video != null || state.recentProjects.any((p) => p.id == state.project.id)
+                        ? state.project.name : context.bheText('项目列表'),
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  )),
+                  const Icon(LucideIcons.chevronDown, size: 16),
+                ]),
               ),
+            ),
+          ),
+          if (section == _WorkspaceSection.review)
+            IconButton(
+              key: const ValueKey('review-undo-top'),
+              onPressed: state.canUndoReview ? () => unawaited(state.undoReview()) : null,
+              tooltip: context.bheText('撤销上一步'),
+              icon: const Icon(LucideIcons.rotateCcw, size: 19),
             ),
           if (onOpenExport != null)
             IconButton(
@@ -528,24 +564,9 @@ class _TopBar extends StatelessWidget {
               icon: const Icon(LucideIcons.download, size: 19),
             ),
           IconButton(
-            onPressed: onCreateProject,
+            onPressed: state.pickerBusy ? null : onCreateProject,
             tooltip: l10n?.newProject ?? '新建项目',
             icon: const Icon(LucideIcons.plus, size: 20),
-          ),
-          PopupMenuButton<Locale>(
-            tooltip: l10n?.switchLanguage ?? '切换语言',
-            icon: const Icon(LucideIcons.languages, size: 20),
-            onSelected: onLocaleChanged,
-            itemBuilder: (context) => [
-              PopupMenuItem(
-                value: BheLocale.zh,
-                child: Text(l10n?.languageChinese ?? '简体中文'),
-              ),
-              PopupMenuItem(
-                value: BheLocale.en,
-                child: Text(l10n?.languageEnglish ?? 'English'),
-              ),
-            ],
           ),
           PopupMenuButton<String>(
             tooltip: l10n?.more ?? '更多操作',
@@ -555,29 +576,18 @@ class _TopBar extends StatelessWidget {
                 case 'theme':
                   onToggleTheme();
                   break;
-                case 'new':
-                  onCreateProject();
-                  break;
-                case 'projects':
-                  await _showProjectList(context, state);
-                  break;
-                case 'closeProject':
-                  if (_canManageProjects(context, state) && !await state.closeManagedProject() && context.mounted) _projectActionFailed(context, state);
-                  break;
-                case 'import':
-                  if (_canManageProjects(context, state)) {
-                    await state.importProject(requireIdle: true);
-                    if (context.mounted && state.projectManagementBlockReason != null) _canManageProjects(context, state);
-                  }
-                  break;
-                case 'delete':
-                  if (_canManageProjects(context, state)) await _confirmManagedDelete(context, state, state.project);
-                  break;
-                case 'renameProject':
-                  await _showProjectRename(context, state);
-                  break;
-                case 'undo':
-                  await state.undoReview();
+                case 'language':
+                  final locale = await showDialog<Locale>(
+                    context: context,
+                    builder: (dialog) => SimpleDialog(
+                      title: Text(context.bheText('语言')),
+                      children: [
+                        SimpleDialogOption(onPressed: () => Navigator.pop(dialog, BheLocale.zh), child: const Text('简体中文')),
+                        SimpleDialogOption(onPressed: () => Navigator.pop(dialog, BheLocale.en), child: const Text('English')),
+                      ],
+                    ),
+                  );
+                  if (locale != null) onLocaleChanged(locale);
                   break;
                 case 'update':
                   onCheckUpdate();
@@ -587,50 +597,21 @@ class _TopBar extends StatelessWidget {
                     context, error: state.diagnosticError,
                   );
                   break;
+                case 'about':
+                  await _showAboutDialog(context, state);
+                  break;
               }
             },
             itemBuilder: (context) => [
-              if (section == _WorkspaceSection.review) ...[
-                PopupMenuItem(
-                  value: 'undo',
-                  enabled: state.canUndoReview,
-                  child: Text(context.bheText('撤销上一步')),
-                ),
-                const PopupMenuDivider(),
-              ],
-              PopupMenuItem(
-                value: 'projects',
-                child: Text(context.bheText('项目列表')),
-              ),
-              PopupMenuItem(
-                value: 'new',
-                child: Text(l10n?.newProject ?? '新建项目'),
-              ),
-              PopupMenuItem(
-                value: 'import',
-                child: Text(l10n?.openPackage ?? '打开项目包'),
-              ),
-              PopupMenuItem(
-                value: 'renameProject',
-                enabled: state.project.video != null || state.recentProjects.any((p) => p.id == state.project.id),
-                child: Text(context.bheText('重命名项目')),
-              ),
-              PopupMenuItem(
-                value: 'closeProject',
-                enabled: state.project.video != null || state.recentProjects.any((p) => p.id == state.project.id),
-                child: Text(context.bheText('关闭项目')),
-              ),
-              PopupMenuItem(
-                value: 'delete',
-                child: Text(
-                  l10n?.deleteProject ?? '删除项目',
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
-                ),
-              ),
-              const PopupMenuDivider(),
               PopupMenuItem(
                 value: 'theme',
-                child: Text(context.bheText(dark ? '切换浅色主题' : '切换深色主题')),
+                child: Text(Localizations.localeOf(context).languageCode == 'zh'
+                    ? '主题 · ${dark ? '深色' : '浅色'}'
+                    : 'Theme · ${dark ? 'Dark' : 'Light'}'),
+              ),
+              PopupMenuItem(
+                value: 'language',
+                child: Text(Localizations.localeOf(context).languageCode == 'zh' ? '语言 · 简体中文' : 'Language · English'),
               ),
               PopupMenuItem(
                 value: 'update',
@@ -640,11 +621,71 @@ class _TopBar extends StatelessWidget {
                 value: 'diagnostics',
                 child: Text(context.bheText('反馈与诊断')),
               ),
+              PopupMenuItem(
+                value: 'about',
+                child: Text(context.bheText('关于')),
+              ),
             ],
           ),
         ],
       ),
     );
+  }
+}
+
+Future<void> _showProjectActions(BuildContext context, MobileAppState state) async {
+  final hasProject = state.project.video != null || state.recentProjects.any((p) => p.id == state.project.id);
+  final l10n = Localizations.of<BheLocalizations>(context, BheLocalizations);
+  final action = await showModalBottomSheet<String>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    builder: (sheet) {
+      Widget row(String id, String label, {bool enabled = true, bool danger = false}) => InkWell(
+        key: ValueKey('project-action-$id'),
+        onTap: enabled ? () => Navigator.pop(sheet, id) : null,
+        child: Container(
+          constraints: const BoxConstraints(minHeight: 52),
+          padding: const EdgeInsets.fromLTRB(16, 0, 4, 0),
+          alignment: Alignment.centerLeft,
+          child: Text(label, style: TextStyle(color: danger ? Theme.of(context).colorScheme.error : enabled ? null : Theme.of(context).disabledColor)),
+        ),
+      );
+      Widget group(List<Widget> rows) => Material(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(12),
+        clipBehavior: Clip.antiAlias,
+        child: Column(children: [for (final (i, item) in rows.indexed) ...[
+          if (i > 0) const Padding(padding: EdgeInsets.only(left: 16), child: Divider(height: 1)), item,
+        ]]),
+      );
+      return _SheetFrame(title: context.bheText('项目列表'), child: Column(children: [
+        group([
+          row('projects', context.bheText('项目列表')),
+          if (hasProject) row('renameProject', context.bheText('重命名项目')),
+          row('import', l10n?.openPackage ?? '打开项目包', enabled: !state.pickerBusy),
+          if (hasProject) row('closeProject', context.bheText('关闭项目')),
+        ]),
+        if (hasProject) ...[
+          const SizedBox(height: 12),
+          group([row('delete', l10n?.deleteProject ?? '删除项目', danger: true)]),
+        ],
+      ]));
+    },
+  );
+  if (!context.mounted) return;
+  switch (action) {
+    case 'projects': await _showProjectList(context, state);
+    case 'renameProject': await _showProjectRename(context, state);
+    case 'import':
+      if (_canManageProjects(context, state)) {
+        await state.importProject(requireIdle: true);
+        if (context.mounted && state.projectManagementBlockReason != null) _canManageProjects(context, state);
+      }
+    case 'closeProject':
+      if (_canManageProjects(context, state) && !await state.closeManagedProject() && context.mounted) _projectActionFailed(context, state);
+    case 'delete':
+      if (_canManageProjects(context, state)) await _confirmManagedDelete(context, state, state.project);
   }
 }
 
@@ -685,6 +726,7 @@ class _ProjectView extends StatelessWidget {
               _VideoPreparationCard(message: state.preparingVideoMessage, onCancel: state.cancelVideoPreparation)
             else if (state.project.video == null)
               _EmptyProject(
+                enabled: !state.pickerBusy,
                 onPick: () { unawaited(_createManagedProject(context, state)); },
               )
             else
@@ -747,8 +789,9 @@ class _PageIntro extends StatelessWidget {
 }
 
 class _EmptyProject extends StatelessWidget {
-  const _EmptyProject({required this.onPick});
+  const _EmptyProject({required this.onPick, this.enabled = true});
   final VoidCallback onPick;
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
@@ -776,7 +819,7 @@ class _EmptyProject extends StatelessWidget {
             ),
             const SizedBox(height: 20),
             FilledButton.icon(
-              onPressed: onPick,
+              onPressed: enabled ? onPick : null,
               icon: const Icon(LucideIcons.upload, size: 18),
               label: Text(l10n?.selectVideo ?? '选择视频'),
             ),
@@ -1370,17 +1413,31 @@ class _ReviewViewState extends State<_ReviewView> {
     String? rim,
     String? player,
   }) async {
+    final anchorMs = controller?.value.isPlaying == true
+        ? controller!.value.position.inMilliseconds
+        : selected?.startMs ?? 0;
     _cancelCompletionPrompt();
     setState(() {
       statusFilter = status ?? statusFilter;
       rimFilter = rim ?? rimFilter;
       playerFilter = player ?? playerFilter;
-      selectedIndex = 0;
-      _selectedId = null;
+      final items = candidates;
+      final nearest = nearestReviewCandidate(
+        items,
+        anchorMs: anchorMs,
+        startMs: (candidate) => candidate.startMs,
+      );
+      selectedIndex = nearest == null ? 0 : items.indexOf(nearest);
+      _selectedId = nearest?.id;
       _completionPromptShown = false;
     });
-    final first = selected;
-    if (first != null) await _replay(first);
+    final candidate = selected;
+    if (candidate != null) {
+      unawaited(_scrollToSelected());
+      await _replay(candidate);
+    } else {
+      await _pausePlayback();
+    }
   }
 
   Candidate? get selected {
@@ -1694,10 +1751,26 @@ class _ReviewViewState extends State<_ReviewView> {
   }
 
   Future<void> _scrollToSelected() async {
-    if (selectedIndex >= _candidateKeys.length) return;
+    if (!mounted) return;
+    final index = selectedIndex;
+    final items = candidates;
+    if (index < 0 || index >= items.length) {
+      return;
+    }
+    final id = items[index].id;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      final target = _candidateKeys[selectedIndex].currentContext;
-      if (target != null && mounted) {
+      if (!mounted) return;
+      final current = candidates;
+      if (selectedIndex != index ||
+          index < 0 ||
+          index >= current.length ||
+          index >= _candidateKeys.length ||
+          current[index].id != id ||
+          selected?.id != id) {
+        return;
+      }
+      final target = _candidateKeys[index].currentContext;
+      if (target != null && target.mounted) {
         Scrollable.ensureVisible(
           target,
           alignment: .45,
@@ -2005,7 +2078,7 @@ class _ReviewViewState extends State<_ReviewView> {
 
   ({String id, bool last, Future<ReviewActionResult> saved})? _reviewAt(String id, CandidateSelection selection) {
     if (state.projectTransitioning) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(context.bheText('正在切换项目，请稍候'))));
+      showBheToast(context, context.bheText('正在切换项目，请稍候'));
       return null;
     }
     final items = candidates;
@@ -2026,7 +2099,7 @@ class _ReviewViewState extends State<_ReviewView> {
           if (restored >= 0) unawaited(_select(restored));
         }
         if (state.reviewNotice != '保存失败，请重试') {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(context.bheText('本次审核未保存'))));
+          showBheToast(context, context.bheText('本次审核未保存'));
         }
         return;
       }
@@ -2744,11 +2817,18 @@ class _FullscreenReviewPageState extends State<_FullscreenReviewPage> {
                     fontWeight: FontWeight.w600,
                   ),
                 )),
-                Text(
-                  '$included/${_candidates.length}',
-                  style: TextStyle(
-                    color: BhePalette.orange.withValues(alpha: .9),
-                    fontSize: 12,
+                // L225：窄屏/横屏下这段统计会撑破 Row（RenderFlex overflow），
+                // 改成可收缩 + 省略，不挤掉左侧标题。
+                Flexible(
+                  child: Text(
+                    '$included/${_candidates.length}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.end,
+                    style: TextStyle(
+                      color: BhePalette.orange.withValues(alpha: .9),
+                      fontSize: 12,
+                    ),
                   ),
                 ),
               ],
@@ -4096,11 +4176,20 @@ Future<void> _showPlayerPicker(
   );
   if (value == null || !context.mounted || session != state.projectSession) return;
   final normalized = value.trim();
-  if (normalized.isEmpty) {
-    await state.setCandidatePlayer(candidate.id, null);
-  } else {
-    if (!await state.addPlayer(normalized) || session != state.projectSession) return;
-    await state.setCandidatePlayer(candidate.id, normalized);
+  final player = normalized.isEmpty ? null : normalized;
+  if (player == candidate.player) return;
+  if (player != null && !state.project.players.contains(player)) {
+    final added = await state.addPlayer(player);
+    if (!context.mounted || session != state.projectSession) return;
+    if (!added) {
+      _showReviewSaveFailure(context, state.diagnosticError);
+      return;
+    }
+  }
+  final saved = await state.setCandidatePlayer(candidate.id, player);
+  if (!context.mounted || session != state.projectSession) return;
+  if (!saved) {
+    _showReviewSaveFailure(context, state.reviewDiagnosticError);
   }
 }
 
@@ -4763,6 +4852,117 @@ Future<void> _showRoiEditor(BuildContext context, MobileAppState state) async {
   );
   if (result != null) state.updateRois(hoop: result.hoop, net: result.net);
 }
+
+Future<void> _showAboutDialog(BuildContext context, MobileAppState state) async {
+  final l10n = Localizations.of<BheLocalizations>(context, BheLocalizations);
+  String? engineVersion;
+  try {
+    final snapshot = await MobileDiagnostics.instance.snapshot();
+    final value = snapshot.environment['native_package_version'];
+    if (value is String && value.isNotEmpty && value != 'unknown') {
+      engineVersion = value;
+    }
+  } catch (_) {}
+  if (!context.mounted) return;
+  await showDialog<void>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: Text(dialogContext.bheText('关于')),
+      content: SingleChildScrollView(child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '${dialogContext.bheText('版本')}：'
+            '${mobileAppVersion == 'dev' ? dialogContext.bheText('开发版') : mobileAppVersion}',
+          ),
+          const SizedBox(height: 8),
+          if (engineVersion != null)
+            Text('${dialogContext.bheText('分析引擎版本')}：$engineVersion'),
+          const Divider(height: 28),
+          const SizedBox(height: 8),
+          Material(
+            color: Theme.of(dialogContext).brightness == Brightness.dark
+                ? BhePalette.surface2
+                : Theme.of(dialogContext).colorScheme.surface,
+            clipBehavior: Clip.antiAlias,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(
+                color: Theme.of(dialogContext).brightness == Brightness.dark
+                    ? const Color(0xFF31343F)
+                    : const Color(0xFFE5E7EB),
+              ),
+            ),
+            child: InkWell(
+              key: const ValueKey('about-third-party-notices'),
+              onTap: () => showLicensePage(
+                context: dialogContext,
+                applicationName: 'BHE',
+                applicationVersion: 'v$mobileAppVersion',
+              ),
+              child: SizedBox(
+                height: 52,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          Localizations.localeOf(dialogContext).languageCode == 'zh'
+                              ? '第三方许可'
+                              : 'Third-party notices',
+                        ),
+                      ),
+                      Icon(
+                        LucideIcons.chevronRight,
+                        size: 18,
+                        color: Theme.of(dialogContext).colorScheme.onSurface,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      )),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext),
+          style: TextButton.styleFrom(
+            foregroundColor: Theme.of(dialogContext).colorScheme.onSurface,
+            minimumSize: const Size(64, 44),
+          ),
+          child: Text(l10n?.text('关闭') ?? '关闭'),
+        ),
+        OutlinedButton(
+          style: _aboutOutlinedStyle(dialogContext, const Size(96, 44)),
+          onPressed: () {
+            Navigator.pop(dialogContext);
+            unawaited(
+              showMobileDiagnostics(context, error: state.diagnosticError),
+            );
+          },
+          child: Text(l10n?.text('现在反馈') ?? '现在反馈'),
+        ),
+      ],
+    ),
+  );
+}
+
+ButtonStyle _aboutOutlinedStyle(BuildContext context, Size minimumSize) {
+  final dark = Theme.of(context).brightness == Brightness.dark;
+  return OutlinedButton.styleFrom(
+    foregroundColor: Theme.of(context).colorScheme.onSurface,
+    minimumSize: minimumSize,
+    side: BorderSide(
+      color: dark ? const Color(0xFF6B7180) : const Color(0xFF6B7280),
+    ),
+    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+  );
+}
+
 
 class _UpdateSheet extends StatelessWidget {
   const _UpdateSheet({required this.updater, required this.state});

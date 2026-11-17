@@ -135,7 +135,12 @@ function Assert-NoReparseAncestors([string]$Path) {
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             throw 'Automatic updates do not support linked installation directories.'
         }
-        $item = $item.Parent
+        # FileInfo has Directory rather than Parent; directory ancestors use Parent.
+        if ($item -is [IO.FileInfo]) {
+            $item = $item.Directory
+        } else {
+            $item = $item.Parent
+        }
     }
 }
 
@@ -177,28 +182,105 @@ function Assert-ReleaseTree([string]$Root, [string]$Version = '') {
     }
     $pending = New-Object 'System.Collections.Generic.Stack[string]'
     $pending.Push($Root)
+    # Python regenerates __pycache__ bytecode caches inside the bundled
+    # runtime whenever any interpreter runs without PYTHONDONTWRITEBYTECODE
+    # (manual debugging, pip installs). Machine-derived cache content is
+    # cleaned instead of failing the update; every other extra file or
+    # folder still blocks the update as foreign content.
+    $cacheFiles = New-Object 'System.Collections.Generic.List[string]'
+    $extraFolders = New-Object 'System.Collections.Generic.List[string]'
+    $foreignFolders = New-Object 'System.Collections.Generic.List[string]'
+    $foreignFiles = New-Object 'System.Collections.Generic.List[string]'
     while ($pending.Count -gt 0) {
         $directory = $pending.Pop()
         # One literal .NET enumeration per directory avoids tens of thousands
         # of Test-Path calls on packaged Python/Torch installations.
         $info = New-Object IO.DirectoryInfo($directory)
+        $parentRelative = ''
+        if (!$directory.Equals($Root, [StringComparison]::OrdinalIgnoreCase)) {
+            $parentRelative = $directory.Substring($Root.Length + 1).Replace('\', '/')
+        }
+        $insideCache = $parentRelative -match '(^|/)__pycache__$'
+        $insideCacheSubtree = $parentRelative -match '(^|/)__pycache__(/|$)'
         foreach ($item in $info.EnumerateFileSystemInfos()) {
             $relative = $item.FullName.Substring($Root.Length + 1).Replace('\', '/')
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
                 throw "Linked file or folder found: $relative. Please update manually."
             }
             if ($item.Attributes -band [IO.FileAttributes]::Directory) {
-                if (!$directories.Remove($relative)) {
-                    throw "Extra folder found: $relative. Move personal files outside BHE before updating."
+                $inventoried = $directories.Remove($relative)
+                if ($insideCacheSubtree) {
+                    # A cache may contain bytecode files only; nested folders
+                    # are never treated as cache content, even when inventoried.
+                    $foreignFolders.Add($relative)
+                    continue
                 }
                 $pending.Push($item.FullName)
+                if (!$inventoried) { $extraFolders.Add($relative) }
+            } elseif ($insideCacheSubtree) {
+                if ($insideCache -and $item.Name -match '\.pyc$') {
+                    if (!$files.Remove($relative)) { $cacheFiles.Add($relative) }
+                } else {
+                    # This also rejects non-bytecode files listed in a release
+                    # inventory: __pycache__ is reserved for .pyc files.
+                    $foreignFiles.Add($relative)
+                }
             } elseif (!$files.Remove($relative)) {
-                throw "Extra file found: $relative. Move personal files outside BHE before updating."
+                $foreignFiles.Add($relative)
             }
         }
     }
-    foreach ($missing in $files) { throw "Release file missing: $missing" }
-    foreach ($missing in $directories) { throw "Release directory missing: $missing" }
+    if ($foreignFiles.Count -gt 0) {
+        throw "Extra file found: $($foreignFiles[0]). Move personal files outside BHE before updating."
+    }
+    if ($foreignFolders.Count -gt 0) {
+        throw "Extra folder found: $($foreignFolders[0]). Move personal files outside BHE before updating."
+    }
+    # An unlisted folder is tolerated only when it is an ancestor of a
+    # generated .pyc that will be removed. Unrelated empty folders still block.
+    $cacheAncestors = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($relative in $cacheFiles) {
+        $ancestor = $relative
+        while ($ancestor -match '/') {
+            $ancestor = $ancestor -replace '/[^/]+$', ''
+            if ($extraFolders.Contains($ancestor)) { [void]$cacheAncestors.Add($ancestor) }
+        }
+    }
+    foreach ($folder in $extraFolders) {
+        if (!$cacheAncestors.Contains($folder)) {
+            throw "Extra folder found: $folder. Move personal files outside BHE before updating."
+        }
+    }
+    if ($cacheFiles.Count -gt 0 -or $extraFolders.Count -gt 0) {
+        foreach ($relative in $cacheFiles) {
+            $path = Join-Path $Root $relative
+            # Recheck the file and every ancestor immediately before deletion.
+            Assert-NoReparseAncestors $path
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+        # Prune only directories made empty by bytecode deletion. Never recurse
+        # into an unknown directory or infer deletion authority from its name.
+        foreach ($relative in ($extraFolders | Sort-Object { $_.Length } -Descending)) {
+            $path = Join-Path $Root $relative
+            if (!(Test-Path -LiteralPath $path -PathType Container)) { continue }
+            Assert-NoReparseAncestors $path
+            if ([IO.Directory]::GetFileSystemEntries($path).Count -gt 0) {
+                throw "Extra folder found: $relative. Move personal files outside BHE before updating."
+            }
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+        Write-UpdateLog 'preflight' 'cleaned' "Removed $($cacheFiles.Count) cache files and pruned $($extraFolders.Count) empty cache-only folders."
+    }
+    # Inventory drift is tolerated only for individual bytecode files and
+    # empty cache directories; unrelated files and folders remain protected.
+    foreach ($missing in $files) {
+        if ($missing -match '(^|/)__pycache__/[^/]+\.pyc$') { continue }
+        throw "Release file missing: $missing"
+    }
+    foreach ($missing in $directories) {
+        if ($missing -match '(^|/)__pycache__$') { continue }
+        throw "Release directory missing: $missing"
+    }
 }
 
 function Expand-VerifiedPackage([string]$Archive, [string]$Destination) {

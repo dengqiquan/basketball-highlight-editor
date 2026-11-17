@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import time
@@ -184,6 +185,33 @@ def test_standalone_merge_cancels_running_job(tmp_path, monkeypatch):
         time.sleep(0.01)
     assert job["state"] == "cancelled"
     assert not (tmp_path / "joined.mp4").exists()
+
+
+@pytest.mark.parametrize("x", [0.0, 0.9])
+@pytest.mark.parametrize("coarse_crossing", [False, True])
+def test_short_rim_track_with_observed_rebound_or_side_exit_stays_excluded(
+    tmp_path, x, coarse_crossing
+):
+    from engine.python.basketball_engine.adapters import analysis as adapter
+    from basketball_highlight.rim_check import assess_rim_crossing
+    from tests.test_rim_check import RIM, ball
+
+    frames = [[ball(x, y)] for y in [-0.05, 0.2, 0.5, 0.85, 1.1, 0.7, 0.3, 0.7, 1.2]]
+    raw = assess_rim_crossing(frames, RIM)
+    assert raw["rebound"] is True and raw["entry"] is False
+    assert raw["track_points"] == 9 and raw["track_span"] == 1.25
+    matches = [{"time": 10.0, "coarse_crossing": coarse_crossing, "score": 0.9, "confidence": "high"}]
+    adapter.apply_rim_checks(matches, [{"time": 10.0, "rim": RIM}], {"results": [{"frames": frames}]})
+    service, store, video, model = _analysis_fixture(tmp_path)
+    store.replace_candidates(video["id"], [])
+    row = adapter.candidate_to_row(
+        matches[0], video["id"], store.active_roi(video["id"])["id"], 20000, 3, 1, "probe"
+    )
+    store.replace_candidates(video["id"], [row])
+    persisted = store.list_candidates(video["id"])[0]
+    assert persisted["review_status"] == "excluded"
+    assert persisted["selection_status"] == "excluded"
+    assert matches[0]["rim_check"]["reason"] == ("exit_off_center" if x else "rebound")
 
 
 def test_inspect_video_rejects_non_object_ffprobe_output(tmp_path: Path, monkeypatch):
@@ -974,6 +1002,12 @@ def test_candidate_previews_use_at_most_two_ffmpeg_processes(
             return "", ""
 
     monkeypatch.setattr("engine.python.basketball_engine.service.subprocess.Popen", FakeProcess)
+    # L127：抽帧前会先 inspect 源片判 HDR；fake 环境没有真 ffprobe，
+    # 让 run 直接报错，_preview_frame_vf 应回退到纯缩放（不映射）。
+    monkeypatch.setattr(
+        "engine.python.basketball_engine.service.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(subprocess.CalledProcessError(1, "ffprobe")),
+    )
 
     counts = service._prepare_candidate_previews(
         store=store,
@@ -1588,12 +1622,157 @@ def test_extract_preview_generates_frame_and_reuses_cached_frame(tmp_path: Path,
     def fail_if_called(*args, **kwargs):
         raise AssertionError("cached preview should not invoke ffmpeg")
 
-    monkeypatch.setattr("basketball_engine.service.subprocess.run", fail_if_called)
+    monkeypatch.setattr("basketball_engine.service.subprocess.Popen", fail_if_called)
     cached = service.handle(
         "extract_preview",
         {"project_root": str(project_root), "video_id": video["id"], "time_ms": 200},
     )
     assert cached == result
+
+
+@pytest.mark.parametrize("change", ["none", "mtime", "size"])
+def test_preview_source_validation_uses_matching_metadata(tmp_path: Path, monkeypatch, change):
+    source = tmp_path / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+        "-i", "testsrc=size=320x240:rate=10", "-t", "1", "-pix_fmt", "yuv420p", str(source),
+    ], check=True)
+    root = tmp_path / "project"
+    service = EngineService()
+    service.create_project({"name": "预览", "root_path": str(root)})
+    video = service.link_video({"project_root": str(root), "video_path": str(source)})["video"]
+    if change == "mtime":
+        stat = source.stat()
+        os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    elif change == "size":
+        with source.open("ab") as stream:
+            stream.write(b"changed")
+    calls = []
+    original = EngineService._source_fingerprint
+    def fingerprint_spy(path):
+        calls.append(path)
+        return original(path)
+    monkeypatch.setattr(EngineService, "_source_fingerprint", staticmethod(fingerprint_spy))
+    output = root / "cached.jpg"
+    output.write_bytes(b"cached")
+    payload = {"project_root": str(root), "video_id": video["id"], "output_path": str(output)}
+    if change in {"mtime", "size"}:
+        with pytest.raises(ProtocolError) as error:
+            service.extract_preview(payload)
+        assert error.value.code == "VIDEO_SOURCE_CHANGED"
+    else:
+        assert service.extract_preview(payload)["path"] == str(output)
+    assert len(calls) == (0 if change == "none" else 1)
+
+
+def test_export_still_checks_content_when_metadata_matches(tmp_path: Path):
+    source = tmp_path / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+        "-i", "testsrc=size=320x240:rate=10", "-t", "1", "-pix_fmt", "yuv420p", str(source),
+    ], check=True)
+    root = tmp_path / "project"
+    service = EngineService()
+    service.create_project({"name": "导出", "root_path": str(root)})
+    video = service.link_video({"project_root": str(root), "video_path": str(source)})["video"]
+    stat = source.stat()
+    content = bytearray(source.read_bytes())
+    content[-1] ^= 1
+    source.write_bytes(content)
+    os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    with pytest.raises(ProtocolError) as error:
+        service._export_videos(service._require_store({"project_root": str(root)}), [{"video_id": video["id"]}])
+    assert error.value.code == "VIDEO_SOURCE_CHANGED"
+
+
+def _preview_commands(monkeypatch):
+    commands = []
+    real_popen = subprocess.Popen
+
+    def spy(command, *args, **kwargs):
+        commands.append(command)
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr("basketball_engine.service.subprocess.Popen", spy)
+    return commands
+
+
+def _project_with_proxy(tmp_path: Path, start_ms: int, end_ms: int):
+    source = tmp_path / "source.mp4"
+    proxy = tmp_path / "proxy.mp4"
+    for path, size, rate in ((source, "320x240", 10), (proxy, "160x120", 3)):
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", f"testsrc=size={size}:rate={rate}",
+                "-t", "8" if path == source else str((end_ms - start_ms) / 1000), "-pix_fmt", "yuv420p", str(path),
+            ],
+            check=True,
+        )
+    project_root = tmp_path / "project"
+    service = EngineService()
+    service.handle("create_project", {"name": "测试项目", "root_path": str(project_root)})
+    video = service.handle(
+        "link_video", {"project_root": str(project_root), "video_path": str(source)}
+    )["video"]
+    store = ProjectStore(project_root)
+    store.set_analysis_range(video["id"], start_ms, end_ms)
+    video = store.video(video["id"])
+    job = store.create_job(store.project()["id"], video["id"], "analysis")
+    store.update_job(job["id"], state="running", stage="refine")
+    store.update_job(
+        job["id"],
+        state="completed",
+        stage="done",
+        checkpoint={
+            "proxy_video": str(proxy),
+            "analysis_parameters": {
+                "source_path": str(source.resolve()),
+                "source_fingerprint": video["source_fingerprint"],
+                "source_rotation": int(video.get("rotation") or 0),
+                "analysis_start_ms": start_ms,
+                "analysis_end_ms": end_ms,
+            },
+        },
+    )
+    return service, project_root, video, source, proxy
+
+
+def test_extract_preview_uses_proxy_inside_analysis_window(tmp_path: Path, monkeypatch):
+    service, project_root, video, source, proxy = _project_with_proxy(tmp_path, 1000, 7000)
+    commands = _preview_commands(monkeypatch)
+
+    result = service.handle(
+        "extract_preview",
+        {"project_root": str(project_root), "video_id": video["id"], "time_ms": 3000},
+    )
+
+    frame = Path(result["path"])
+    assert frame.is_file()
+    command = commands[-1]
+    assert str(proxy.resolve()) in command and str(source) not in command
+    assert command[command.index("-ss") + 1] == "2.000"  # 3000ms - 起点 1000ms
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=width,height",
+         "-of", "csv=p=0", str(frame)],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert probe == "640,480"  # 与原片 4:3 宽高比一致
+
+
+def test_extract_preview_falls_back_to_source_outside_proxy_window(
+    tmp_path: Path, monkeypatch
+):
+    service, project_root, video, source, proxy = _project_with_proxy(tmp_path, 1000, 7000)
+    commands = _preview_commands(monkeypatch)
+
+    for time_ms, expected in ((500, source), (6500, source)):
+        service.handle(
+            "extract_preview",
+            {"project_root": str(project_root), "video_id": video["id"], "time_ms": time_ms},
+        )
+        command = commands[-1]
+        assert str(expected) in command and str(proxy.resolve()) not in command
 
 
 def test_persist_candidates_creates_pending_reviews(tmp_path: Path):
@@ -2660,7 +2839,7 @@ def test_coarse_overlay_uses_nearest_ball_independent_of_detection_order():
 
 
 def test_tracking_association_has_a_new_consistent_algorithm_version():
-    assert ANALYSIS_ALGORITHM_VERSION == "python-v2.16-net-focused-roi"
+    assert ANALYSIS_ALGORITHM_VERSION == "python-v2.20-rim-crossing-event-dedupe"
     assert refine_dynamic_candidates.ALGORITHM_VERSION == ANALYSIS_ALGORITHM_VERSION
 
 
@@ -2732,6 +2911,183 @@ def _run_standard_analysis(service, store, video, model):
         json.loads(finished["checkpoint_json"]),
         {candidate["event_time_ms"]: candidate for candidate in store.list_candidates(video["id"])},
     )
+
+
+def test_below_only_rim_evidence_keeps_coarse_candidate_low_and_pending(tmp_path, monkeypatch):
+    from .test_rim_check import RIM, fall
+
+    service, store, video, model = _analysis_fixture(tmp_path)
+
+    def run(commands, output, *_args, **kwargs):
+        if kwargs.get("stage_names") == ("verify_rim_crossing",):
+            command = commands[0]
+            inputs = json.loads(Path(command[command.index("--candidates") + 1]).read_text())["candidates"]
+            frames = {
+                5.0: fall(x_start=1.2, x_end=.9),
+                10.0: fall(hidden={6, 7}),
+                # L386's 19.05s failure shape: only a falling track below the rim.
+                19.05: fall()[8:],
+            }
+            result = {"results": [{"frames": frames[item["time"]]} for item in inputs]}
+        else:
+            scan = Path(commands[1][commands[1].index("--output") + 1])
+            coarse = Path(commands[2][commands[2].index("--output") + 1])
+            scan.parent.mkdir(parents=True, exist_ok=True)
+            scan.write_text(json.dumps({"records": []}), encoding="utf-8")
+            coarse.write_text(json.dumps({"rim": RIM, "candidates": [{
+                "time": 19.05, "rim": RIM,
+                "above": {"time": 18.9, "x": 500, "y": 280, "confidence": .99},
+                "below": {"time": 19.2, "x": 500, "y": 350, "confidence": .99},
+            }]}), encoding="utf-8")
+            result = {"results": [{"refined": [
+                {"time": t, "score": .9, "confidence": "high", "overlay": {"rim": RIM}}
+                for t in (5.0, 10.0)
+            ]}]}
+        Path(output).write_text(json.dumps(result), encoding="utf-8")
+        return {"refined": result, "logs": [], "stage_timings_ms": {}}
+
+    monkeypatch.setattr("engine.python.basketball_engine.service.run_pipeline", run)
+    monkeypatch.setattr(service, "_prepare_candidate_previews", lambda **_: {"generated": 0})
+    _, candidates = _run_standard_analysis(service, store, video, model)
+
+    unknown = candidates[19050]
+    evidence = json.loads(unknown["evidence_json"])
+    assert unknown["confidence"] == "low" and unknown["score"] == 0
+    assert unknown["review_status"] == "pending" and unknown["selection_status"] == "included"
+    assert evidence["confidence_reason"] == "rim_check_insufficient_evidence"
+    assert evidence["rim_check"]["reason"] == "no_crossing"
+    assert evidence["rim_check"]["ball_approached"] is False
+    assert candidates[5000]["review_status"] == "excluded"
+    assert candidates[5000]["review_reason"] == "auto_rim_check"
+    assert candidates[10000]["confidence"] == "high"
+
+    # Reanalysis must not undo a human exclusion just because evidence is uncertain.
+    store.review_candidate(unknown["id"], "excluded", reason="rim_out")
+    _, candidates = _run_standard_analysis(service, store, video, model)
+    assert candidates[19050]["review_status"] == "excluded"
+    assert candidates[19050]["review_reason"] == "rim_out"
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_rim_band_seed_fallback_requires_confirmation_for_high_confidence(
+    tmp_path: Path, monkeypatch, confirmed,
+):
+    import generate_candidates
+
+    service, store, video, model = _analysis_fixture(tmp_path)
+
+    def detection(name, x, y, confidence):
+        return {
+            "name": name, "center": [x, y], "confidence": confidence,
+            "xyxy": [x - 10, y - 5, x + 10, y + 5],
+        }
+
+    # A high-confidence single sighting and a real, separate crossing.
+    records = [
+        {"time": t, "detections": [
+            detection("hoop", 50, 70, .9), detection("ball", 50, y, conf),
+        ]}
+        for t, y, conf in [(7.0, 50, .99), (14.0, 40, .8), (14.5, 100, .8)]
+    ]
+
+    def run(commands, refined_output, *_args, **_kwargs):
+        # Exercise the real standard-mode flag and candidate generator,
+        # rather than injecting an already-normalized seed into the store.
+        command = commands[2]
+        assert "--rim-band-seeds" in command
+        detections = Path(commands[1][commands[1].index("--output") + 1])
+        detections.parent.mkdir(parents=True, exist_ok=True)
+        detections.write_text(json.dumps({
+            "video": str(tmp_path / "source.mp4"), "model": str(model),
+            "records": records,
+        }), encoding="utf-8")
+        with monkeypatch.context() as args:
+            args.setattr(sys, "argv", command[1:])
+            generate_candidates.main(generate_candidates.parse_args())
+        coarse = json.loads(Path(command[command.index("--output") + 1]).read_text())
+        assert len(coarse["candidates"]) == 2
+        assert sum(item.get("seed") == "rim_band_sighting"
+                   for item in coarse["candidates"]) == 1
+        refined = {"results": [{"refined": ([{
+            "time": 7.0, "score": .95, "confidence": "high", "verdict": "made",
+        }] if confirmed else [])}]}
+        Path(refined_output).write_text(json.dumps(refined), encoding="utf-8")
+        return {"refined": refined, "logs": [], "stage_timings_ms": {}}
+
+    monkeypatch.setattr("engine.python.basketball_engine.service.run_pipeline", run)
+    monkeypatch.setattr(service, "_verify_rim_crossings", lambda **_: None)
+    monkeypatch.setattr(service, "_prepare_candidate_previews", lambda **_: {"generated": 0})
+
+    _, candidates = _run_standard_analysis(service, store, video, model)
+
+    assert len(candidates) == 2
+    seed = candidates[7000]
+    evidence = json.loads(seed["evidence_json"])
+    if confirmed:
+        assert seed["confidence"] == "high"
+        assert seed["score"] == .95
+        assert "fallback_reason" not in evidence
+    else:
+        assert seed["confidence"] == "low"
+        assert seed["score"] == 0.0
+        assert evidence["fallback_reason"] == "unconfirmed_rim_band_sighting"
+        assert evidence["coarse_detection_confidence"] == .99
+    assert seed["review_status"] == "pending"
+    assert seed["selection_status"] == "included"
+    crossing = next(item for time_ms, item in candidates.items() if time_ms != 7000)
+    assert crossing["confidence"] == "high"
+    assert crossing["score"] == .8
+    assert "fallback_reason" not in json.loads(crossing["evidence_json"])
+
+
+def test_separate_below_then_above_seeds_reach_rim_review_independently(tmp_path, monkeypatch):
+    import generate_candidates
+    from .test_rim_check import ball
+
+    service, store, video, model = _analysis_fixture(tmp_path)
+    records = [{"time": t, "detections": [
+        {"name": "hoop", "center": [500, 300], "confidence": .9, "xyxy": [475, 290, 525, 310]},
+        {"name": "ball", "center": [x, y], "confidence": confidence, "xyxy": [x-5, y-5, x+5, y+5]},
+    ]} for t, x, y, confidence in [(19.2, 500, 325, .7), (20.0, 530, 270, .9)]]
+
+    def run(commands, output, *_args, **kwargs):
+        if kwargs.get("stage_names") == ("verify_rim_crossing",):
+            command = commands[0]
+            inputs = json.loads(Path(command[command.index("--candidates")+1]).read_text())["candidates"]
+            assert [item["time"] for item in inputs] == [19.2, 20.0]
+            result = {"results": [{"frames": [
+                [ball(0.0 if item["time"] == 19.2 else 1.2, y, rim=item["rim"])]
+                for y in ([.5, .75, 1.0, 1.25] if item["time"] == 19.2
+                          else [-1.5 + step * .25 for step in range(16)])
+            ]} for item in inputs]}
+        else:
+            command = commands[2]
+            detections = Path(commands[1][commands[1].index("--output")+1])
+            detections.parent.mkdir(parents=True, exist_ok=True)
+            detections.write_text(json.dumps({"video": "source.mp4", "model": str(model), "records": records}))
+            with monkeypatch.context() as args:
+                args.setattr(sys, "argv", command[1:])
+                generate_candidates.main(generate_candidates.parse_args())
+            coarse = json.loads(Path(command[command.index("--output")+1]).read_text())
+            result = {"results": [{
+                "coarse": candidate, "refined": [],
+                "rim_local": {"center_x": 500, "rim_y": 300, "width": 50, "height": 20},
+                "fallback_trajectory": [{"time": candidate["time"] + dt, "x": 500, "y": 325 + dt*30}
+                                        for dt in (0, .1, .2)],
+            } for candidate in coarse["candidates"]]}
+        Path(output).write_text(json.dumps(result))
+        return {"refined": result, "logs": [], "stage_timings_ms": {}}
+
+    monkeypatch.setattr("engine.python.basketball_engine.service.run_pipeline", run)
+    monkeypatch.setattr(service, "_prepare_candidate_previews", lambda **_: {"generated": 0})
+    _, candidates = _run_standard_analysis(service, store, video, model)
+    assert set(candidates) == {19200, 20000}
+    assert candidates[19200]["review_status"] == "pending"
+    assert candidates[19200]["confidence"] == "low" and candidates[19200]["score"] == 0
+    assert candidates[20000]["review_status"] == "excluded"
+    for time_ms in (19200, 20000):
+        evidence = json.loads(candidates[time_ms]["evidence_json"])
+        assert evidence["overlay"]["trajectory"][0]["time"] == time_ms / 1000
 
 
 def test_standard_analysis_auto_excludes_candidates_that_fail_the_rim_check(
@@ -2902,3 +3258,291 @@ def test_the_crop_scale_compat_switch_gets_its_own_analysis_stages(tmp_path: Pat
     assert stage_dir() == normal
     monkeypatch.setenv("BHE_CROP_SCALE_COMPAT", "1")
     assert stage_dir() != normal
+
+
+def test_proxy_rejected_after_relink_same_path_and_legacy_metadata(tmp_path):
+    service, root, video, source, proxy = _project_with_proxy(tmp_path, 1000, 7000)
+    store = ProjectStore(root)
+    assert service._latest_proxy_video(store, video['id']) is not None
+    before = service._preview_path(store, video, 3000)
+    source.write_bytes(source.read_bytes() + b'changed')
+    service.relink_video({'project_root': str(root), 'video_id': video['id'], 'video_path': str(source)})
+    updated = store.video(video['id'])
+    assert service._latest_proxy_video(store, video['id']) is None
+    assert service._preview_path(store, updated, 3000) != before
+    job = store.create_job(store.project()['id'], video['id'], 'analysis')
+    store.update_job(job['id'], state='completed', checkpoint={'proxy_video': str(proxy), 'analysis_parameters': {'analysis_start_ms': 1000, 'analysis_end_ms': 7000}})
+    assert service._latest_proxy_video(store, video['id']) is None
+
+
+@pytest.mark.parametrize('damage', ['garbage', 'wrong_size', 'wrong_duration'])
+def test_invalid_proxy_falls_back_to_original(tmp_path, monkeypatch, damage):
+    service, root, video, source, proxy = _project_with_proxy(tmp_path, 1000, 7000)
+    if damage == 'garbage':
+        proxy.write_bytes(b'nonempty garbage')
+    else:
+        size, duration = ('160x160', '6') if damage == 'wrong_size' else ('160x120', '2')
+        subprocess.run(['ffmpeg','-y','-v','error','-f','lavfi','-i',f'testsrc=size={size}:rate=3',
+                        '-t',duration,'-pix_fmt','yuv420p',str(proxy)],check=True)
+    commands = _preview_commands(monkeypatch)
+    result = service.extract_preview({'project_root':str(root), 'video_id':video['id'], 'time_ms':3000})
+    assert Path(result['path']).stat().st_size > 0
+    assert str(source) in commands[-1]
+
+
+def test_proxy_extract_without_frame_retries_source(tmp_path, monkeypatch):
+    service, root, video, source, proxy = _project_with_proxy(tmp_path, 1000, 7000)
+    real_popen = subprocess.Popen
+    def run(command, *args, **kwargs):
+        if str(proxy.resolve()) in command and '-frames:v' in command:
+            return real_popen([sys.executable, '-c', 'pass'], *args, **kwargs)
+        return real_popen(command, *args, **kwargs)
+    monkeypatch.setattr('basketball_engine.service.subprocess.Popen', run)
+    result = service.extract_preview({'project_root':str(root), 'video_id':video['id'], 'time_ms':3000})
+    assert Path(result['path']).stat().st_size > 0
+
+
+def _stub_analysis_pipeline(monkeypatch, service):
+    refined = {"candidates": [{"time": 1.5, "score": 0.8}]}
+
+    def fake_build(**_kwargs):
+        return [["fake", "proxy"], ["fake", "scan"], ["fake", "candidates"]]
+
+    def fake_run(_commands, refined_output, *_args, **_kwargs):
+        Path(refined_output).parent.mkdir(parents=True, exist_ok=True)
+        Path(refined_output).write_text(json.dumps(refined), encoding="utf-8")
+        return {"refined": refined, "logs": [], "cache_hits": 0, "stage_timings_ms": {}}
+
+    monkeypatch.setattr("engine.python.basketball_engine.service.build_pipeline_commands", fake_build)
+    monkeypatch.setattr("engine.python.basketball_engine.service.run_pipeline", fake_run)
+    monkeypatch.setattr(
+        service, "_prepare_candidate_previews", lambda **_: {"generated": 1, "reused": 0, "failed": 0}
+    )
+
+
+def test_cancel_during_persist_is_honoured_instead_of_completing(tmp_path: Path, monkeypatch):
+    """收尾写库那一下点取消：不能再落成 completed，否则界面说「分析完成」并接着跑下一段。"""
+    service, store, video, model = _analysis_fixture(tmp_path)
+    _stub_analysis_pipeline(monkeypatch, service)
+    entered, release = threading.Event(), threading.Event()
+    original = ProjectStore.replace_candidates
+
+    def slow_replace(self, video_id, rows, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(self, video_id, rows, **kwargs)
+
+    monkeypatch.setattr(ProjectStore, "replace_candidates", slow_replace)
+    payload = {
+        "project_root": str(store.root),
+        "video_id": video["id"],
+        "model_path": str(model),
+        "mode": "fast",
+    }
+    ids_before = [row["id"] for row in store.list_candidates(video["id"])]
+    job = service.handle("start_analysis", payload)["job"]
+    worker = service._job_threads[job["id"]]
+    try:
+        assert entered.wait(5)
+        cancelled = service.handle(
+            "cancel_job", {"project_root": str(store.root), "job_id": job["id"]}
+        )["job"]
+        assert cancelled["stage"] == "cancelling"
+    finally:
+        release.set()
+        worker.join(10)
+    assert not worker.is_alive()
+    finished = store.get_job(job["id"])
+    assert finished["state"] == "cancelled"
+    assert finished["error_code"] == "JOB_CANCELLED"
+    # 候选写入与取消决定同一个提交点：取消了就整个回滚，不留新候选、也不替换掉旧审核记录。
+    assert [row["id"] for row in store.list_candidates(video["id"])] == ids_before
+
+
+def test_progress_write_keeps_the_cancelling_stage(tmp_path: Path):
+    """取消后还在跑的进度写入不能把 cancelling 盖回普通阶段。"""
+    _service, store, video, _model = _analysis_fixture(tmp_path)
+    job = store.create_job(store.project()["id"], video["id"], "analysis")
+    store.update_job(job["id"], state="running", stage="cancelling")
+    updated = store.update_job(
+        job["id"], state="running", stage="prepare_review_previews", progress=0.9
+    )
+    assert updated["stage"] == "cancelling"
+    assert updated["progress"] == pytest.approx(0.9)
+
+
+def _demote_analysis_checkpoints_to_legacy(store, video_id):
+    """把已有分析任务的参数降级成 0.1.13 的格式：没有指纹，只有路径/尺寸/时间。"""
+    project = store.project()
+    jobs = store.list_jobs(
+        project_id=project["id"], job_type="analysis", states=("completed",), video_id=video_id,
+    )
+    video = store.video(video_id)
+    assert jobs
+    for job in jobs:
+        checkpoint = json.loads(job["checkpoint_json"])
+        parameters = checkpoint["analysis_parameters"]
+        parameters.pop("source_fingerprint", None)
+        parameters.pop("source_rotation", None)
+        parameters["source_size_bytes"] = video["source_size_bytes"]
+        parameters["source_mtime_ns"] = video["source_mtime_ns"]
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE jobs SET checkpoint_json = ? WHERE id = ?",
+                (json.dumps(checkpoint), job["id"]),
+            )
+
+
+def test_legacy_proxy_is_reused_when_the_source_is_unchanged(tmp_path, monkeypatch):
+    service, root, video, source, proxy = _project_with_proxy(tmp_path, 1000, 7000)
+    store = ProjectStore(root)
+    _demote_analysis_checkpoints_to_legacy(store, video["id"])
+
+    assert service._latest_proxy_video(store, video["id"]) is not None
+    commands = _preview_commands(monkeypatch)
+    result = service.extract_preview({
+        "project_root": str(root), "video_id": video["id"], "time_ms": 3000,
+    })
+
+    assert Path(result["path"]).stat().st_size > 0
+    assert str(Path(proxy).resolve()) in commands[-1]
+
+
+def test_legacy_proxy_is_not_reused_after_the_source_is_replaced_in_place(tmp_path, monkeypatch):
+    service, root, video, source, proxy = _project_with_proxy(tmp_path, 1000, 7000)
+    store = ProjectStore(root)
+    _demote_analysis_checkpoints_to_legacy(store, video["id"])
+    source.write_bytes(source.read_bytes() + b"changed")
+    service.handle("relink_video", {
+        "project_root": str(root), "video_id": video["id"], "video_path": str(source),
+    })
+
+    assert service._latest_proxy_video(store, video["id"]) is None
+    commands = _preview_commands(monkeypatch)
+    result = service.extract_preview({
+        "project_root": str(root), "video_id": video["id"], "time_ms": 3000,
+    })
+
+    assert Path(result["path"]).stat().st_size > 0
+    assert str(Path(source).resolve()) in commands[-1]
+
+
+def test_legacy_proxy_without_recorded_size_or_mtime_is_not_reused(tmp_path):
+    """老任务连尺寸/时间都没记下来时无法证明源没被换过，只能回原片。"""
+    service, root, video, _source, _proxy = _project_with_proxy(tmp_path, 1000, 7000)
+    store = ProjectStore(root)
+    _demote_analysis_checkpoints_to_legacy(store, video["id"])
+    project = store.project()
+    jobs = store.list_jobs(
+        project_id=project["id"], job_type="analysis", states=("completed",), video_id=video["id"],
+    )
+    for job in jobs:
+        checkpoint = json.loads(job["checkpoint_json"])
+        checkpoint["analysis_parameters"].pop("source_size_bytes", None)
+        checkpoint["analysis_parameters"].pop("source_mtime_ns", None)
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE jobs SET checkpoint_json = ? WHERE id = ?",
+                (json.dumps(checkpoint), job["id"]),
+            )
+
+    assert service._latest_proxy_video(store, video["id"]) is None
+
+
+def test_one_continuous_ball_track_is_not_split_into_two_fallbacks(tmp_path,monkeypatch):
+    import copy
+    import generate_candidates as gen
+    import refine_dynamic_candidates as refine
+    from engine.python.basketball_engine import service as sm
+    service,store,video,model=_analysis_fixture(tmp_path)
+    store.save_roi(video['id'],{'x1':0,'y1':0,'x2':960,'y2':720})
+    store.replace_candidates(video['id'],[])
+    # One continuously rising ball, no cut or second ball. Later descent is unobserved.
+    records=[{'time':round(10.+i*.1,1),'detections':[
+      {'name':'hoop','center':[500.,300.],'confidence':.9,'xyxy':[475.,290.,525.,310.]},
+      {'name':'ball','center':[500.,325.-10*i],'confidence':.7+.025*i,'xyxy':[495.,320.-10*i,505.,330.-10*i]}
+    ]}for i in range(8)]
+    monkeypatch.setattr(refine,'load_yolo_model',lambda _:object())
+    monkeypatch.setattr(refine,'select_device',lambda _:'cpu')
+    monkeypatch.setattr(refine,'load_scan_window',lambda:lambda *a,**k:copy.deepcopy(records))
+    captured=[]
+    def run(commands,output,*args,**kwargs):
+        if kwargs.get('stage_names')==('verify_rim_crossing',):
+            command=commands[0];items=json.loads(Path(command[command.index('--candidates')+1]).read_text())['candidates']
+            result={'results':[{'frames':[[copy.deepcopy(r['detections'][1])]for r in records]}for item in items]}
+        else:
+            scan=Path(commands[1][commands[1].index('--output')+1]);scan.parent.mkdir(parents=True,exist_ok=True)
+            scan.write_text(json.dumps({'video':video['source_path'],'model':str(model),'records':records}))
+            with monkeypatch.context()as p:
+                p.setattr(sys,'argv',commands[2][1:]);gen.main(gen.parse_args())
+                p.setattr(sys,'argv',commands[3][1:]);refine.main(refine.parse_args())
+            result=json.loads(Path(output).read_text());captured.extend(result['results'])
+            assert all(not item['refined'] for item in captured)
+        Path(output).write_text(json.dumps(result));return {'refined':result,'logs':[],'stage_timings_ms':{}}
+    monkeypatch.setattr(sm,'run_pipeline',run)
+    monkeypatch.setattr(service,'_prepare_candidate_previews',lambda **k:{'generated':0})
+    payload={'project_root':str(store.root),'video_id':video['id'],'model_path':str(model),'mode':'standard'}
+    job=service._create_analysis_job(payload)['job'];service._run_analysis(payload,job['id'])
+    final=store.get_job(job['id']);assert final['state']=='completed',final
+    rows=store.list_candidates(video['id']);active=[r for r in rows if r['selection_status']!='excluded']
+    trajectories=[item['fallback_trajectory']for item in captured]
+    print(json.dumps({'times_ms':[r['event_time_ms']for r in rows],'active':len(active),'statuses':[r['review_status']for r in rows],'confidence':[r['confidence']for r in rows],'fallback_trajectories':trajectories}))
+    assert len(trajectories)==2 and trajectories[0]==trajectories[1]
+    assert rows[0]['event_time_ms']==10200
+    assert len(active)==1,'One continuous ball track was retained twice as overlapping low fallback candidates'
+
+
+def test_two_crossings_in_one_fallback_track_are_preserved(tmp_path, monkeypatch):
+    import copy
+    import generate_candidates as gen
+    import refine_dynamic_candidates as refine
+    from engine.python.basketball_engine import service as sm
+    (service, store, video, model) = _analysis_fixture(tmp_path)
+    store.save_roi(video['id'], {'x1': 0, 'y1': 0, 'x2': 960, 'y2': 720})
+    store.replace_candidates(video['id'], [])
+
+    def record(t, y, conf):
+        return {'time': t, 'detections': [{'name': 'hoop', 'center': [500.0, 300.0], 'confidence': 0.9, 'xyxy': [475.0, 290.0, 525.0, 310.0]}, {'name': 'ball', 'center': [500.0, y], 'confidence': conf, 'xyxy': [495.0, y - 5, 505.0, y + 5]}]}
+    coarse_records = [record(10.2, 340.0, 0.7), record(12.2, 280.0, 0.9)]
+    records = [record(t, y, 0.09) for (t, y) in [(9.9, 280.0), (10.0, 300.0), (10.1, 320.0), (10.2, 340.0), (10.7, 370.0), (11.2, 340.0), (11.7, 310.0), (12.2, 280.0), (12.3, 300.0), (12.4, 320.0)]]
+    assert [b['time'] for (a, b) in zip(records, records[1:]) if a['detections'][1]['center'][1] < 300 <= b['detections'][1]['center'][1]] == [10.0, 12.3]
+    monkeypatch.setattr(refine, 'load_yolo_model', lambda _: object())
+    monkeypatch.setattr(refine, 'select_device', lambda _: 'cpu')
+    monkeypatch.setattr(refine, 'load_scan_window', lambda : lambda *a, **k: copy.deepcopy(records))
+    captured = []
+
+    def run(commands, output, *args, **kwargs):
+        if kwargs.get('stage_names') == ('verify_rim_crossing',):
+            command = commands[0]
+            items = json.loads(Path(command[command.index('--candidates') + 1]).read_text())['candidates']
+            result = {'results': [{'frames': []} for item in items]}
+        else:
+            scan = Path(commands[1][commands[1].index('--output') + 1])
+            scan.parent.mkdir(parents=True, exist_ok=True)
+            scan.write_text(json.dumps({'video': video['source_path'], 'model': str(model), 'records': coarse_records}))
+            with monkeypatch.context() as p:
+                p.setattr(sys, 'argv', commands[2][1:])
+                gen.main(gen.parse_args())
+                p.setattr(sys, 'argv', commands[3][1:])
+                refine.main(refine.parse_args())
+            result = json.loads(Path(output).read_text())
+            captured.extend(result['results'])
+            assert all((not item['refined'] for item in captured))
+        Path(output).write_text(json.dumps(result))
+        return {'refined': result, 'logs': [], 'stage_timings_ms': {}}
+    monkeypatch.setattr(sm, 'run_pipeline', run)
+    monkeypatch.setattr(service, '_prepare_candidate_previews', lambda **k: {'generated': 0})
+    payload = {'project_root': str(store.root), 'video_id': video['id'], 'model_path': str(model), 'mode': 'standard', 'conf': 0.08}
+    job = service._create_analysis_job(payload)['job']
+    service._run_analysis(payload, job['id'])
+    final = store.get_job(job['id'])
+    assert final['state'] == 'completed', final
+    rows = store.list_candidates(video['id'])
+    active = [r for r in rows if r['selection_status'] != 'excluded']
+    trajectories = [item['fallback_trajectory'] for item in captured]
+    print(json.dumps({'policy': 'current', 'times_ms': [r['event_time_ms'] for r in rows], 'active': len(active), 'statuses': [r['review_status'] for r in rows], 'confidence': [r['confidence'] for r in rows], 'fallback_trajectories': trajectories}))
+    if len(trajectories) == 2:
+        assert trajectories[0] == trajectories[1]
+    assert len(active) == 2, 'Two distinct downward crossings lost one review candidate'
+    # Existing hoop-box plane calibration is 300 - 20 * .28 = 294.4px.
+    assert [json.loads(row["evidence_json"])["overlay"]["crossing"]["time"] for row in rows] == [9.972, 12.272]

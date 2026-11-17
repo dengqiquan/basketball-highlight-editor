@@ -16,6 +16,32 @@ import 'package:media_kit_video/media_kit_video.dart';
 /// 1. 90/270 度时子组件按编码方向排版（外框宽高互换），外层 [RotatedBox] 转到显示方向；
 /// 2. 不强制宽高比：media_kit 把纹理宽、高各自截到 1920×1080 内，竖的 720×1512 会变成
 ///    带左右黑边的 720×1080，调用方传 `BoxFit.cover` 把黑边裁掉（和 4:3 横拍同一个做法）。
+/// 弹原生对话框期间为 true：所有 [OrientedVideo] 换成占位，不再显示视频纹理。
+final ValueNotifier<bool> videoSurfaceHidden = ValueNotifier<bool>(false);
+
+int _videoSurfaceHolds = 0;
+
+/// 测试用：清掉没归还的占位计数，免得上一个用例漏还影响下一个。
+@visibleForTesting
+void resetVideoSurfaceHoldsForTest() {
+  _videoSurfaceHolds = 0;
+  videoSurfaceHidden.value = false;
+}
+
+/// 把视频画面换成占位。引导遮罩、保存窗口等各自占一份，互不覆盖；
+/// 返回的函数只能用一次，用来归还自己那一份，全部归还后画面才恢复。
+VoidCallback holdVideoSurfaceHidden() {
+  _videoSurfaceHolds++;
+  videoSurfaceHidden.value = true;
+  var released = false;
+  return () {
+    if (released) return;
+    released = true;
+    _videoSurfaceHolds--;
+    videoSurfaceHidden.value = _videoSurfaceHolds > 0;
+  };
+}
+
 class OrientedVideo extends StatelessWidget {
   const OrientedVideo({
     super.key,
@@ -34,6 +60,15 @@ class OrientedVideo extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: videoSurfaceHidden,
+      builder: (context, hidden, _) => hidden && controller != null
+          ? const ColoredBox(color: Colors.black)
+          : _buildVideo(),
+    );
+  }
+
+  Widget _buildVideo() {
     final c = controller;
     if (c == null) {
       return const SizedBox.shrink();

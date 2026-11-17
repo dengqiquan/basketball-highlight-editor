@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import re
@@ -9,6 +10,8 @@ import tempfile
 import threading
 import time
 from collections import deque
+from contextlib import nullcontext
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict
 from uuid import uuid4
@@ -16,6 +19,7 @@ from uuid import uuid4
 from .analysis import PipelineCancelled, terminate_process
 from ..diagnostics import log_diagnostic, log_failed_command
 from ..media_tools import resolve_media_tool
+from .hdr import TONEMAP_FILTER, SDR_TAGS
 
 
 # NVIDIA, Intel, AMD, then the Windows Media Foundation encoder, which works
@@ -314,6 +318,7 @@ def _effect_command(
     codec_options: list[str],
     frame_size: tuple[int, int] | None,
     spec: Dict[str, Any],
+    tonemap: bool = False,
 ) -> list[str]:
     """一条 ffmpeg 命令完成：切段、慢放、拼接、回放。所有段统一到同一个尺寸和音频格式再拼。"""
     width, height = frame_size or spec["size"]
@@ -321,6 +326,7 @@ def _effect_command(
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
     )
+    color_filter = f"{TONEMAP_FILTER}," if tonemap else ""
     audio = spec["has_audio"]
     duration_ms = end_ms - start_ms
     cuts: list[tuple[float, float, float]] = []
@@ -340,7 +346,7 @@ def _effect_command(
             continue
         pace = "setpts=PTS-STARTPTS" if speed == 1.0 else f"setpts=(PTS-STARTPTS)/{speed}"
         graph.append(
-            f"[0:v:0]setpts=PTS-STARTPTS,trim=start={t0 / 1000:.3f}:end={t1 / 1000:.3f},{pace},{fit}[v{index}]"
+            f"[0:v:0]setpts=PTS-STARTPTS,trim=start={t0 / 1000:.3f}:end={t1 / 1000:.3f},{pace},{color_filter}{fit}[v{index}]"
         )
         if audio:
             tempo = "" if speed == 1.0 else f",atempo={speed}"
@@ -361,7 +367,7 @@ def _effect_command(
             "-ss", f"{replay['start_ms'] / 1000:.3f}", "-t", f"{window_s:.3f}", "-i", str(source_video),
         ]
         graph.append(
-            f"[1:v:0]setpts=(PTS-STARTPTS)/{REPLAY_SPEED},crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
+            f"[1:v:0]setpts=(PTS-STARTPTS)/{REPLAY_SPEED},{color_filter}crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
             f"fps={spec['fps']:.6f},{fit}[v{index}]"
         )
         if audio:
@@ -378,7 +384,7 @@ def _effect_command(
         *command_inputs,
         "-filter_complex", ";".join(graph),
         "-map", "[vout]", *(["-map", "[aout]"] if audio else []),
-        *codec_options, *(["-c:a", "aac", "-b:a", "128k"] if audio else []),
+        *codec_options, *(SDR_TAGS if tonemap else []), *(["-c:a", "aac", "-b:a", "128k"] if audio else []),
         "-movflags", "+faststart", str(output_path),
     ]
 
@@ -393,6 +399,8 @@ def build_clip_command(
     effect: Dict[str, Any] | None = None,
     uniform_audio: bool = False,
     has_audio: bool = True,
+    tonemap: bool = False,
+    frame_rate: str | None = None,
 ) -> list[str]:
     if start_ms < 0 or end_ms <= start_ms:
         raise ValueError("INVALID_CLIP_RANGE")
@@ -400,7 +408,8 @@ def build_clip_command(
     codec = video_codec or video_codecs()[0]
     codec_options = video_codec_options(codec)
     if effect:
-        return _effect_command(source_video, start_ms, end_ms, output_path, codec_options, frame_size, effect)
+        command = _effect_command(source_video, start_ms, end_ms, output_path, codec_options, frame_size, effect, tonemap)
+        return _with_frame_rate(command, frame_rate)
     command = [
         resolve_media_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
         "-ss", f"{start_ms / 1000:.3f}", "-i", str(source_video),
@@ -412,40 +421,135 @@ def build_clip_command(
         "-map", "0:v:0?",
         *(["-map", "0:a:0?"] if has_audio else ["-an"]),
         *(
-            [
-                "-vf",
-                f"scale={frame_size[0]}:{frame_size[1]}:force_original_aspect_ratio=decrease,"
-                f"pad={frame_size[0]}:{frame_size[1]}:(ow-iw)/2:(oh-ih)/2,setsar=1",
-            ]
-            if frame_size else []
+            ["-vf", ",".join(filter(None, [
+                TONEMAP_FILTER if tonemap else None,
+                (f"scale={frame_size[0]}:{frame_size[1]}:force_original_aspect_ratio=decrease,"
+                 f"pad={frame_size[0]}:{frame_size[1]}:(ow-iw)/2:(oh-ih)/2,setsar=1") if frame_size else None,
+            ]))] if tonemap or frame_size else []
         ),
         *codec_options,
+        *(SDR_TAGS if tonemap else []),
         *(["-c:a", "aac", "-b:a", "128k"] if has_audio else []),
         # 开了慢放时，带回放的片段音频是 48kHz 立体声；没有回放的片段也统一成这样才能直接拼接。
         *(["-ar", "48000", "-ac", "2"] if uniform_audio and has_audio else []),
         "-movflags", "+faststart", str(output_path),
     ]
-    return command
+    return _with_frame_rate(command, frame_rate)
+
+
+def _with_frame_rate(command: list[str], frame_rate: str | None) -> list[str]:
+    """需要统一帧率时在输出文件前加 -r；不需要时原样返回，命令一字不变。"""
+    if not frame_rate:
+        return command
+    return [*command[:-1], "-r", frame_rate, command[-1]]
+
+
+def _frame_rate_text(fps: float) -> str:
+    """把 59.94 这类浮点帧率还原成 60000/1001 这样的精确分数，时间基才能对上。"""
+    for base in (24, 30, 48, 60, 120):
+        if abs(fps - base * 1000 / 1001) < 0.02:
+            return f"{base * 1000}/1001"
+    ratio = Fraction(fps).limit_denominator(1001)
+    return f"{ratio.numerator}/{ratio.denominator}"
+
+
+def _merge_frame_rate(candidates: list[Dict[str, Any]], candidate: Dict[str, Any]) -> str | None:
+    """合并导出时，帧率和第一段不同的片段要统一到第一段的帧率，否则直接拼接会错乱时间戳。"""
+    try:
+        target = float(candidates[0].get("fps") or 0)
+        fps = float(candidate.get("fps") or 0)
+    except (TypeError, ValueError):
+        return None
+    if target <= 0 or fps <= 0 or abs(fps - target) <= 0.005:
+        return None
+    return _frame_rate_text(target)
+
+
+def _uniform_frame_rate(paths: list[Path]) -> str | None:
+    """各片段的帧率/时间基不一致时返回第一段的帧率（用来统一），一致或探测失败返回 None。"""
+    seen = []
+    try:
+        for path in paths:
+            result = subprocess.run(
+                [resolve_media_tool("ffprobe"), "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=r_frame_rate,avg_frame_rate,time_base", "-of", "json", str(path)],
+                check=True, capture_output=True, text=True, timeout=15,
+            )
+            stream = json.loads(result.stdout)["streams"][0]
+            rate, avg, base = stream["r_frame_rate"], stream["avg_frame_rate"], stream["time_base"]
+            if Fraction(rate) <= 0 or Fraction(avg) <= 0 or Fraction(base) <= 0:
+                raise ValueError("invalid frame rate")
+            seen.append((rate, avg, base))
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError, ZeroDivisionError) as exc:
+        raise OSError("无法探测片段帧率") from exc
+    if not seen:
+        raise OSError("缺少视频流")
+    if all(item == seen[0] and item[0] == item[1] for item in seen):
+        return None
+    return seen[0][1]
+
+
+def _audio_layouts(paths: list[Path]) -> list[tuple[str, int] | None]:
+    """Read actual encoded stream layouts before deciding whether concat is safe."""
+    layouts = []
+    for path in paths:
+        result = subprocess.run(
+            [resolve_media_tool("ffprobe"), "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=sample_rate,channels", "-of", "json", str(path)],
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+        streams = json.loads(result.stdout)["streams"]
+        if not streams:
+            layouts.append(None)
+        else:
+            rate, channels = str(streams[0]["sample_rate"]), int(streams[0]["channels"])
+            if int(rate) <= 0 or channels <= 0:
+                raise ValueError("invalid audio format")
+            layouts.append((rate, channels))
+    return layouts
+
+
+def _merged_duration_ok(path: Path, expected_ms: int, *, require_audio: bool = False) -> bool:
+    """Require the expected streams and check their durations; unknown is failure."""
+    try:
+        result = subprocess.run(
+            [resolve_media_tool("ffprobe"), "-v", "error", "-show_entries", "stream=codec_type,duration",
+             "-of", "json", str(path)],
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+        streams = json.loads(result.stdout)["streams"]
+        durations = {stream["codec_type"]: float(stream["duration"]) for stream in streams
+                     if stream.get("codec_type") in {"video", "audio"}}
+        required = {"video", "audio"} if require_audio else {"video"}
+        if not required.issubset(durations):
+            return False
+        expected = expected_ms / 1000
+        tolerance = max(0.5, expected * 0.02)
+        return all(math.isfinite(duration) and duration > 0 and abs(duration - expected) <= tolerance
+                   for duration in durations.values())
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return False
 
 
 def validate_media_file(path: Path) -> None:
     if not path.is_file() or path.stat().st_size <= 0:
         raise OSError(f"导出文件为空: {path}")
-    result = subprocess.run(
-        [
-            resolve_media_tool("ffprobe"), "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
-        stdin=subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=15,
-    )
+    command = [
+        resolve_media_tool("ffprobe"), "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+    ]
+    for attempt, timeout in enumerate((15, 60)):
+        try:
+            result = subprocess.run(
+                command, check=True, capture_output=True, stdin=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            )
+            break
+        except subprocess.TimeoutExpired:
+            if attempt:
+                raise
+            log_diagnostic("export validation ffprobe timed out after 15s; retrying once (60s)")
     try:
         duration = float(result.stdout.strip())
     except ValueError as exc:
@@ -520,8 +624,6 @@ def run_atomic_ffmpeg(
             if stderr_stream is not None:
                 stderr_stream.close()
         validate_media_file(temporary)
-        if cancel_check and cancel_check():
-            raise PipelineCancelled("JOB_CANCELLED")
         temporary.replace(output_path)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         log_failed_command("media command failed", atomic_command, getattr(exc, "returncode", None))
@@ -561,80 +663,26 @@ def merge_overlapping_candidates(candidates):
     return merged
 
 
-def merge_overlapping_candidates_by_player(candidates):
-    groups = {}
-    for candidate in candidates:
-        groups.setdefault(candidate.get("player_id"), []).append(candidate)
-    return [clip for group in groups.values() for clip in merge_overlapping_candidates(group)]
-
-
-def merge_duplicate_auto_candidates(candidates, max_event_gap_ms=2500):
-    """Join nearby automatic detections of one play before writing clips."""
-    def same_rim(left, right):
-        if not isinstance(left, dict) or not isinstance(right, dict):
-            return True
-        try:
-            width = max(float(left["width"]), float(right["width"]))
-            left_x = float(left.get("x", left.get("center_x")))
-            right_x = float(right.get("x", right.get("center_x")))
-            left_y = float(left.get("y", left.get("rim_y")))
-            right_y = float(right.get("y", right.get("rim_y")))
-            return (
-                abs(left_x - right_x) <= 1.5 * width
-                and abs(left_y - right_y) <= 1.5 * width
+def _compatible_color_streams(paths: list[Path]) -> bool:
+    """Mixed-source concat must not stream-copy incompatible color streams."""
+    streams = []
+    try:
+        for path in paths:
+            result = subprocess.run(
+                [resolve_media_tool("ffprobe"), "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name,pix_fmt,width,height,color_space,color_transfer,color_primaries,color_range",
+                 "-of", "json", str(path)],
+                check=True, capture_output=True, text=True, timeout=15,
             )
-        except (KeyError, TypeError, ValueError):
-            return True
-
-    groups = []
-    for index, candidate in sorted(
-        enumerate(candidates), key=lambda item: int(item[1]["event_time_ms"])
-    ):
-        event_time = int(candidate["event_time_ms"])
-        start = int(candidate["review_start_ms"])
-        end = int(candidate["review_end_ms"])
-        if start < 0 or end <= start:
-            raise ValueError("INVALID_CLIP_RANGE")
-        group = next((
-            group for group in groups
-            if not candidate.get("manual")
-            and not group["manual"]
-            and candidate["source_path"] == group["source_path"]
-            and candidate.get("player_name") == group["player_name"]
-            and same_rim(candidate.get("rim"), group["rim"])
-            and event_time - group["first_time"] <= max_event_gap_ms
-            and start <= group["end"]
-            and end >= group["start"]
-        ), None)
-        if group is None:
-            groups.append({
-                "members": [(index, candidate)],
-                "first_time": event_time,
-                "start": start,
-                "end": end,
-                "manual": bool(candidate.get("manual")),
-                "source_path": candidate["source_path"],
-                "player_name": candidate.get("player_name"),
-                "rim": candidate.get("rim"),
-            })
-        else:
-            group["members"].append((index, candidate))
-            group["start"] = min(group["start"], start)
-            group["end"] = max(group["end"], end)
-    merged = []
-    for group in sorted(groups, key=lambda item: min(index for index, _ in item["members"])):
-        members = [candidate for _, candidate in group["members"]]
-        winner = max(members, key=lambda item: (
-            item.get("review_status") == "goal",
-            int(item["event_time_ms"]),
-        ))
-        merged.append({
-            **winner,
-            "review_start_ms": group["start"],
-            "review_end_ms": group["end"],
-            "has_audio": all(bool(item.get("has_audio", True)) for item in members),
-        })
-    return merged
+            stream = json.loads(result.stdout)["streams"][0]
+            fields = ("codec_name", "pix_fmt", "width", "height", "color_space", "color_transfer", "color_primaries", "color_range")
+            values = tuple(stream.get(field) for field in fields)
+            if any(value in (None, "unknown", "unspecified") for value in values):
+                return False
+            streams.append(values)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError):
+        return False
+    return bool(streams) and all(item == streams[0] for item in streams)
 
 
 def export_goal_clips(
@@ -685,6 +733,8 @@ def export_goal_clips(
                     spec,
                     uniform_audio=effect != "none",
                     has_audio=bool(candidate.get("has_audio", True)),
+                    tonemap=bool(candidate.get("tonemap")),
+                    frame_rate=_merge_frame_rate(candidates, candidate) if mode == "merge" else None,
                 ),
                 path,
                 codecs,
@@ -705,9 +755,10 @@ def export_goal_clips(
                 else available_output_path(output_dir / "highlights.mp4")
             )
             merged_existed = merged_path.exists()
-            concat_file = output_dir / "concat.txt"
-            if not concat_file.exists():
-                created_files.append(concat_file)
+            # 拼接清单用唯一的隐藏名：输出目录可能是用户自己选的文件夹，
+            # 里面若有同名 concat.txt 会被覆盖，用完还要能安全删掉。
+            concat_file = output_dir / f".bhe-concat-{uuid4().hex}.txt"
+            created_files.append(concat_file)
             concat_file.write_text(
                 "".join(concat_manifest_entry(path) for path in files),
                 encoding="utf-8",
@@ -717,31 +768,98 @@ def export_goal_clips(
                 "-f", "concat", "-safe", "0", "-i", str(concat_file),
                 "-c", "copy", str(merged_path),
             ]
+            mixed_color = any(c.get("tonemap") for c in candidates) and any(
+                not c.get("tonemap") for c in candidates
+            )
+            normalize_color = mixed_color and not _compatible_color_streams(files)
             try:
+                audio_layouts = _audio_layouts(files)
+            except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError) as exc:
+                # 探测不出各片段的音轨布局时不能按 copy 快路径直出，改走重编码归一化。
+                log_diagnostic(f"audio layout probe failed, normalizing: {exc}")
+                audio_layouts = None
+            # 无音轨的片段按导出时的 has_audio 标记补静音；探测到确实没有音轨也补。
+            silent_inputs = [not candidate.get("has_audio", True) for candidate in candidates]
+            if audio_layouts is not None:
+                silent_inputs = [
+                    silent or layout is None
+                    for silent, layout in zip(silent_inputs, audio_layouts)
+                ]
+            expect_audio = any(not silent for silent in silent_inputs)
+            normalize_audio = audio_layouts is None or (
+                expect_audio and len(set(audio_layouts)) > 1
+            )
+            try:
+                if normalize_audio:
+                    raise OSError("audio layouts require normalization")
+                if normalize_color:
+                    raise OSError("incompatible color streams require re-encoding")
                 run_atomic_ffmpeg(
                     merge_command,
                     merged_path,
                     cancel_check=cancel_check,
                     process_callback=process_callback,
                 )
+                if not _merged_duration_ok(merged_path, total_ms, require_audio=expect_audio):
+                    raise OSError("merged duration does not match the clips")
             except (OSError, subprocess.CalledProcessError) as exc:
                 log_diagnostic(f"merge copy failed, re-encoding: {exc}")
                 # Separate clips use a common encoder, so stream-copy is the
                 # fast path. Re-encode only when timestamps/codecs prevent a
                 # valid concat output.
-                run_encoded_ffmpeg(
-                    lambda codec: [
-                        resolve_media_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
-                        "-f", "concat", "-safe", "0", "-i", str(concat_file),
-                        *video_codec_options(codec),
-                        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
-                        str(merged_path),
-                    ],
-                    merged_path,
-                    codecs,
-                    cancel_check=cancel_check,
-                    process_callback=process_callback,
-                )
+                # A concat demuxer exposes the first stream's color range for
+                # the whole sequence, so normalize each input independently.
+                # Clips whose frame rate or time base differ cannot be concatenated
+                # as-is either: the demuxer rescales timestamps and the result runs
+                # long. Bring them to the first clip's rate first.
+                rate_target = _uniform_frame_rate(files)
+                needs_normalize = normalize_color or normalize_audio or rate_target is not None
+                with (tempfile.TemporaryDirectory(prefix="bhe-color-", dir=output_dir)
+                      if needs_normalize else nullcontext(None)) as temp:
+                    normalized_manifest = concat_file
+                    color_tags = []
+                    if needs_normalize:
+                        normalized = []
+                        for index, path in enumerate(files):
+                            normalized_path = Path(temp) / f"{index}.mp4"
+                            run_encoded_ffmpeg(
+                                lambda codec: [
+                                    resolve_media_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
+                                    "-i", str(path),
+                                    *(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"] if normalize_audio and silent_inputs[index] else []),
+                                    *(["-map", "0:v:0", "-map", "1:a:0", "-shortest"] if normalize_audio and silent_inputs[index] else []),
+                                    *(["-map", "0:v:0", "-map", "0:a:0"] if normalize_audio and not silent_inputs[index] else []),
+                                    *(["-vf", "scale=in_range=auto:out_range=tv,format=yuv420p"] if normalize_color else []),
+                                    *(["-r", rate_target] if rate_target else []),
+                                    *video_codec_options(codec), *(SDR_TAGS if normalize_color else []),
+                                    "-c:a", "aac", "-b:a", "128k", *(["-ar", "48000", "-ac", "2"] if normalize_audio else []), "-movflags", "+faststart",
+                                    str(normalized_path),
+                                ],
+                                normalized_path, codecs, cancel_check=cancel_check,
+                                process_callback=process_callback,
+                            )
+                            normalized.append(normalized_path)
+                        normalized_manifest = Path(temp) / "concat.txt"
+                        normalized_manifest.write_text(
+                            "".join(concat_manifest_entry(path) for path in normalized), encoding="utf-8",
+                        )
+                        color_tags = SDR_TAGS if normalize_color else []
+                    run_encoded_ffmpeg(
+                        lambda codec: [
+                            resolve_media_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
+                            "-f", "concat", "-safe", "0", "-i", str(normalized_manifest),
+                            *video_codec_options(codec), *color_tags,
+                            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+                            str(merged_path),
+                        ],
+                        merged_path, codecs, cancel_check=cancel_check,
+                        process_callback=process_callback,
+                    )
+                if not _merged_duration_ok(merged_path, total_ms, require_audio=expect_audio):
+                    if not merged_existed:
+                        merged_path.unlink(missing_ok=True)
+                    raise OSError("合并成品流或时长校验失败")
+            concat_file.unlink(missing_ok=True)
             if not merged_existed:
                 created_files.append(merged_path)
             if progress_callback:
@@ -760,84 +878,3 @@ def export_goal_clips(
         "merged_overlap_count": merged_overlap_count,
         "processing_ms": round((time.perf_counter() - started) * 1000),
     }
-
-
-def probe_merge_input(path: Path) -> dict[str, Any]:
-    """Read only the stream properties needed to normalize a standalone clip."""
-    result = subprocess.run(
-        [resolve_media_tool("ffprobe"), "-v", "error", "-show_streams", "-of", "json", str(path)],
-        check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
-    )
-    streams = json.loads(result.stdout).get("streams", [])
-    video = next((item for item in streams if item.get("codec_type") == "video"), None)
-    if not video or not video.get("width") or not video.get("height"):
-        raise ValueError(f"无法读取视频画面：{path}")
-    return {
-        "width": int(video["width"]),
-        "height": int(video["height"]),
-        "has_audio": any(item.get("codec_type") == "audio" for item in streams),
-    }
-
-
-def merge_existing_videos(
-    input_paths: list[Path],
-    output_path: Path,
-    progress_callback=None,
-    cancel_check=None,
-    process_callback=None,
-) -> str:
-    """Normalize arbitrary local clips, then concatenate in the supplied order."""
-    if len(input_paths) < 2:
-        raise ValueError("至少选择两个视频")
-    paths = [Path(path).expanduser().resolve() for path in input_paths]
-    output = normalize_output_path(Path(output_path).expanduser())
-    if output.suffix.lower() != ".mp4":
-        raise ValueError("合并视频只能导出 MP4")
-    if any(not path.is_file() for path in paths):
-        raise ValueError("找不到所选视频")
-    if output.resolve() in paths:
-        raise ValueError("MERGE_SOURCE_CONFLICT: 输出位置不能覆盖输入视频")
-    if len(set(paths)) != len(paths):
-        raise ValueError("请勿重复选择同一个视频")
-    output = validate_output_file(output)
-    first = probe_merge_input(paths[0])
-    width = max(2, first["width"] // 2 * 2)
-    height = max(2, first["height"] // 2 * 2)
-    with tempfile.TemporaryDirectory(prefix="bhe-merge-", dir=str(output.parent)) as temp_name:
-        temporary = Path(temp_name)
-        clips = []
-        codecs = video_codecs()
-        for index, path in enumerate(paths):
-            if cancel_check and cancel_check():
-                raise PipelineCancelled("JOB_CANCELLED")
-            info = first if index == 0 else probe_merge_input(path)
-            clip = temporary / f"clip_{index:04d}.mp4"
-
-            def command(codec):
-                args = [resolve_media_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error", "-i", str(path)]
-                if not info["has_audio"]:
-                    args += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
-                args += [
-                    "-map", "0:v:0", "-map", "0:a:0" if info["has_audio"] else "1:a:0",
-                    "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p",
-                    *video_codec_options(codec), "-r", "30", "-c:a", "aac", "-ar", "48000", "-ac", "2",
-                    "-af", "apad", "-shortest", "-movflags", "+faststart", str(clip),
-                ]
-                return args
-
-            codec = run_encoded_ffmpeg(
-                command, clip, codecs, cancel_check=cancel_check, process_callback=process_callback,
-            )
-            # Concat stream-copy needs exactly the same encoder for every clip.
-            codecs = [codec]
-            clips.append(clip)
-            if progress_callback:
-                progress_callback((index + 1) / (len(paths) + 1))
-        manifest = temporary / "concat.txt"
-        manifest.write_text("".join(concat_manifest_entry(path) for path in clips), encoding="utf-8")
-        run_atomic_ffmpeg(
-            [resolve_media_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
-             "-f", "concat", "-safe", "0", "-i", str(manifest), "-c", "copy", str(output)],
-            output, cancel_check=cancel_check, process_callback=process_callback,
-        )
-    return str(output)

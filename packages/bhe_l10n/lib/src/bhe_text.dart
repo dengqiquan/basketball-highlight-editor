@@ -79,6 +79,23 @@ extension BheBuildContextText on BuildContext {
 }
 
 String? _translateDynamic(String source) {
+  final missingOpened = RegExp(r'^第 ([\d、]+) 段的原视频找不到，请在导入页重新定位$').firstMatch(source);
+  if (missingOpened != null) {
+    return 'The original video for part ${missingOpened.group(1)!.replaceAll('、', ', ')} is missing - relink it on the Import page';
+  }
+  final missingSkipped = RegExp(r'^第 ([\d、]+) 段的原视频找不到，已跳过；请在导入页重新定位后再分析$').firstMatch(source);
+  if (missingSkipped != null) {
+    return 'The original video for part ${missingSkipped.group(1)!.replaceAll('、', ', ')} is missing, so it was skipped - relink it on the Import page, then analyse';
+  }
+  final volumePercent = RegExp(r'^音量 (\d+)%$').firstMatch(source);
+  if (volumePercent != null) return 'Volume ${volumePercent.group(1)}%';
+  final exportElapsed = RegExp(r'^已用 (\d+:\d+(?::\d+)?)$').firstMatch(source);
+  if (exportElapsed != null) return 'Elapsed ${exportElapsed.group(1)}';
+  final savedPath = RegExp(r'^项目(可能)?保存在：([\s\S]+)，可在首页「打开项目」选择该文件夹。$').firstMatch(source);
+  if (savedPath != null) {
+    final prefix = savedPath.group(1) == null ? 'Project saved at' : 'Project may have been saved at';
+    return '$prefix: ${savedPath.group(2)}. Select this folder using “Open project” on the home screen.';
+  }
   final historyMore = RegExp(r'^查看全部 (\d+) 条$').firstMatch(source);
   if (historyMore != null) return 'View all ${historyMore.group(1)} entries';
   final labelBatch = RegExp(r'^已完成 (\d+)/(\d+) 个标签$').firstMatch(source);
@@ -414,6 +431,9 @@ String _englishDuration(String value) => value
     .trim();
 
 const _englishText = <String, String>{
+  '请在弹出的窗口中选择保存位置': 'Please choose where to save in the window that opens',
+  '找回保存窗口': 'Bring save window to front',
+  '第三方开源许可': 'Third-party notices',
   '已调整': 'Edited',
   '重叠': 'Overlap',
   '诊断信息暂时不可用。': 'Diagnostics are temporarily unavailable.',
@@ -449,6 +469,9 @@ const _englishText = <String, String>{
   '这个视频的格式手机无法处理。': 'This phone cannot process this video format.',
   '出错了：视频分析未完成，请重试。': 'Something went wrong: video analysis did not finish. Please try again.',
   '出错了：视频导出未完成，请重试。': 'Something went wrong: video export did not finish. Please try again.',
+  '无法打开分享面板，请重试。': "Couldn't open the share sheet. Please try again.",
+  '无法保存到相册，请重试。': "Couldn't save to Photos. Please try again.",
+  '没有相册保存权限，请在系统设置中允许 BHE 添加照片。': 'BHE does not have permission to save to Photos. Allow photo access in Settings and try again.',
   '出错了：更新操作未完成，请重试。': 'Something went wrong: the update did not finish. Please try again.',
   '出错了：操作未完成，请重试。': 'Something went wrong: the operation did not finish. Please try again.',
   '重命名项目': 'Rename project',
@@ -861,6 +884,11 @@ const _englishText = <String, String>{
   '打开标注': 'Show annotations',
   '退出横屏审核': 'Exit landscape review',
   '播放速度': 'Playback speed',
+  '静音': 'Mute',
+  '静音 / 取消静音': 'Mute / unmute',
+  '取消静音': 'Unmute',
+  '音量 -10%': 'Volume -10%',
+  '音量 +10%': 'Volume +10%',
   '选择球员标签': 'Choose player tag',
   '不选': 'Exclude',
   '还没有候选片段': 'No candidate clips yet',
@@ -1022,6 +1050,35 @@ const _englishText = <String, String>{
   '投篮分析区太小': 'Shot analysis area is too small',
   '检测区域无法保存': 'Detection region could not be saved',
   '检测区域超出画面': 'Detection region is outside the frame',
+  '导入未确认，项目已保留；稍后打开检查，请勿重复导入':
+      'Import not confirmed. The project is saved; reopen it later to check. Do not import it again.',
+  '项目可能已创建；稍后打开检查，请勿重复导入':
+      'The project may have been created. Reopen it later to check; do not import it again.',
+  '无法记住项目目录': 'Could not remember the project folder',
+  '项目正在读取，请稍后重试': 'The project is being read. Please try again shortly.',
+  '请求队列已满，请稍后重试': 'The request queue is full. Please try again shortly.',
+  '导入失败，项目已保留': 'Import failed. The project was kept',
+  '校验原视频': 'Checking source video',
+  '复核原视频': 'Rechecking source video',
+  '导出启动结果尚未确认，请重新连接后检查现有任务。': 'Export start is unconfirmed. Reconnect and check existing tasks.',
+  '导出任务保护状态读取失败，已忽略': 'Could not read export protection status; it was ignored.',
+  '上一次导出启动结果未确认，请先查看导出任务': 'The previous export start is unconfirmed. Check export tasks first.',
+  '未找到可确认的导出任务，请检查后再决定是否允许重新导出。': 'No matching export task was found. Check before allowing another export.',
+  '查看导出任务': 'Check export tasks',
+  '导出任务状态无法保存，请下次打开项目时重新检查。': 'Could not save export status. Check again when reopening the project.',
+  '无法保存导出任务状态，未开始导出。': 'Could not save export status. The export was not started.',
+  '允许再次导出？': 'Allow another export?',
+  '请先检查导出任务和已生成的文件。上一次导出可能仍在运行或已经完成。': 'Check export tasks and generated files first. The previous export may still be running or may have finished.',
+  '已检查，允许再次导出': 'Checked, allow another export',
+  '原项目没有视频指纹，无法比对原视频内容。': 'This project has no video fingerprint; the source content cannot be compared.',
+  '项目正在导出，请等待完成或取消': 'The project is exporting. Wait for it to finish or cancel it.',
+  '导入未确认，项目已保留': 'Import was not confirmed. The project was kept',
+  '项目可能已创建': 'The project may have been created',
+  '复制项目路径': 'Copy project path',
+  '导入失败，项目已保留；稍后可从最近项目打开。':
+      'Import failed. The project is saved; you can open it later from recent projects.',
+  '无法记住项目目录，请记下项目保存位置。':
+      'Could not remember the project folder. Please note where the project was saved.',
   '处理时间较长': 'Processing may take a while',
   '请从左上向右下拖出一个有效矩形，再松开鼠标。':
       'Drag a valid rectangle from top left to bottom right, then release the mouse.',
@@ -1307,6 +1364,89 @@ const _englishText = <String, String>{
   '球员已删除': 'Player deleted',
   '选择输出位置失败：': 'Could not choose an output location: ',
   '正在准备输出位置…': 'Preparing output location…',
+  '跳过': 'Skip',
+  '选中一个候选就会播放对应的片段，每个候选前后会多留一点画面。': 'Pick a candidate to play that clip; each one includes a little footage before and after.',
+  '每一行是系统认为可能进球的一段。逐个看一遍，是进球就保留，不是就排除。': 'Each row is a moment the app thinks may be a made shot. Go through them: keep the goals, exclude the rest.',
+  '常用快捷键': 'Common shortcuts',
+  '完整列表：右上角「更多」→「快捷键一览」': 'Full list: top-right "More" → "Keyboard shortcuts"',
+  '给片段打球员标签': 'Tag a clip with a player',
+  '点这里选球员；还没有球员就新建，也可以从「球员分组」一键导入。打过标签，导出时可以每个球员各出一个视频。': 'Click here to pick a player; create one if there are none, or import a saved player group. Tagged clips can be exported as one video per player.',
+  '片段前后不对？调范围': 'Clip starts or ends in the wrong place? Adjust the range',
+  '点这里打开范围编辑：拖动两端、拖到边缘继续延长，或播放到合适位置按 I 设为开始、O 设为结束。原视频不会被修改。': 'Open the range editor: drag either end (drag to the edge to extend), or play to the right spot and press I for start, O for end. Your original video is never changed.',
+  '候选预览 / 原视频': 'Candidate preview / Original video',
+  '切到「原视频」可以看整段录像、补上系统没找到的进球。': 'Switch to "Original" to watch the whole recording and add goals the app missed.',
+  '播放 / 暂停': 'Play / Pause',
+  '后退 2 秒': 'Back 2 s',
+  '加 Shift 后退 0.1 秒': 'Hold Shift to go back 0.1 s',
+  '前进 2 秒': 'Forward 2 s',
+  '加 Shift 前进 0.1 秒': 'Hold Shift to go forward 0.1 s',
+  '保留这个候选': 'Keep this candidate',
+  '排除这个候选': 'Exclude this candidate',
+  '撤销上一步审核': 'Undo last review action',
+  '循环播放当前片段': 'Loop the current clip',
+  '显示 / 隐藏识别标注': 'Show / hide detection overlay',
+  '给片段选第 N 个球员': 'Tag with the Nth player',
+  '清除球员标签': 'Clear the player tag',
+  '快捷键一览': 'Keyboard shortcuts',
+  '审核页': 'Review page',
+  '调整范围窗口': 'Range editor window',
+  '把当前位置设为开始': 'Set current position as start',
+  '把当前位置设为结束': 'Set current position as end',
+  '前后 1 秒': '1 s back / forward',
+  '按球员标签各出一个视频': 'One video per player tag',
+  '给候选打过球员标签后，这里会多出「每个标签各合成一个视频」：每个标签一个 MP4，文件名就是标签名。': 'Once candidates are tagged with players, "One video per tag" appears here: one MP4 per tag, named after the tag.',
+  '导入分四步': 'Import in four steps',
+  '选视频 → 定分析范围 → 设检测区域 → 开始分析。上面的步骤条可以点回已经完成的步骤，设置会自动保存为草稿。': 'Pick a video → set the analysis range → set detection areas → start analysis. Click a finished step above to go back; settings are saved as a draft automatically.',
+  '先选原始视频': 'Pick the original video first',
+  '支持 MP4、MOV、M4V、AVI、MKV。同一场的多段视频可以一起选，会建成一个项目。原视频不会被修改或上传。': 'MP4, MOV, M4V, AVI and MKV are supported. Pick several videos from the same game together to make one project. Your original video is never changed or uploaded.',
+  '只分析需要的一段': 'Analyze only the part you need',
+  '拖动时间轴两端，选出要分析的范围，比如跳过赛前热身；不确定就保持整段。范围越短，分析越快。': 'Drag both ends of the timeline to choose the range, e.g. skip the warm-up; keep the whole video if unsure. A shorter range analyzes faster.',
+  '框出篮筐': 'Mark the hoop',
+  '系统会先自动识别篮筐。不准的话在画面上拖动、缩放；篮筐被挡住时，先换一个画面时间再框。': 'The app detects the hoop automatically. If it is off, drag or resize on the picture; if the hoop is blocked, change the frame time first.',
+  '橙色和白色两个区域': 'Two areas: orange and white',
+  '橙色区域覆盖来球轨迹、篮圈和落球范围，用来跟踪球；白色区域只盖篮网摆动范围。点这两个按钮切换要编辑的区域，改动自动保存。': "The orange area covers the ball's path, the rim and where the ball lands; the white area covers only the net's swing. Use these two buttons to switch which one you edit; changes save automatically.",
+  '每个进球留多长': 'How long is each goal clip',
+  '设置进球前、后各保留几秒。后面审核时，每个片段还能单独调整。': 'Set how many seconds to keep before and after each goal. You can still adjust each clip during review.',
+  '标准还是快速': 'Standard or fast',
+  '标准分析更完整、漏检少，推荐；快速分析更快，但可能漏掉少量片段。': 'Standard analysis is more thorough and misses less (recommended); fast analysis is quicker but may miss a few clips.',
+  '开始分析': 'Start analysis',
+  '点右下角的按钮开始（多段视频先保存这一段的设置，再在列表里「分析全部」）。分析在后台进行，结束后到「审核」页逐个确认候选。': "Click the button at the bottom right to start (with several videos, save this one's settings, then \"Analyze all\" in the list). Analysis runs in the background; when done, check candidates one by one on the Review page.",
+  '正确：橙色框盖住来球轨迹、篮圈和网下落球范围，白色虚线框只盖篮网': "Right: the orange box covers the ball's path, the rim and where the ball lands; the white dashed box covers only the net",
+  '太大：别把整块篮板、球员和地面框进去': "Too big: don't include the whole backboard, players or floor",
+  '太小：只框篮圈，球一靠近或落下就出框': "Too small: a box on the rim alone loses the ball as soon as it comes near or drops",
+  '框选示例': "Detection area examples",
+  "先框投篮分析区（橙色）": "First: shot analysis area (orange)",
+  "再框篮网检测区（白色）": "Next: net detection area (white)",
+  "橙色框覆盖球靠近篮圈上方、穿过篮圈到落出网下的整段路线。区域要明显大于篮圈，宽约占画面的四分之一以上，太小系统会提示；别框进整块篮板、球员或地面。系统会先自动识别，不准就拖动或缩放；篮筐被挡住先换画面时间。":
+      "The orange box covers the ball path from above the rim, through it and below the net. Make it much larger than the rim, at least about one quarter of the frame width; the app warns if it is too small. Exclude the whole backboard, players and floor. The app detects it first; drag or resize if needed. If the hoop is blocked, pick another frame.",
+  "点下面的「篮网检测区」按钮切换白色框，只覆盖篮圈下沿到网底的篮网摆动范围，用来判断球有没有穿网。别框进篮板、球员或地面；改动自动保存。":
+      "Click the Net detection area button below to select the white box. Cover only the net swing from the bottom of the rim to the bottom of the net to detect whether the ball went through. Exclude the backboard, players and floor. Changes save automatically.",
+  "正确：白色框只覆盖篮网摆动范围": "Right: the white box covers only the net swing",
+  "太大：别把篮板、球员或地面框进去": "Too big: exclude the backboard, players and floor",
+  "太小：只框网口，漏掉网底的摆动":
+      "Too small: framing only the opening misses the net bottom",
+  "投篮分析区（橙色）": "Shot analysis area (orange)",
+  "篮网检测区（白色）": "Net detection area (white)",
+  '看示例': "See examples",
+  '橙色区域用来跟踪球：从球进入篮圈上方，到落出篮网下方。白色区域只盖篮网摆动范围，用来判断球有没有穿网。系统会先自动识别，不准再拖动或缩放。': "The orange area tracks the ball from above the rim to below the net. The white area covers only the net's swing and is used to tell whether the ball went through. The app detects the hoop first; drag or resize only if it is off.",
+  '全部 / 保留 / 排除': "All / Kept / Excluded",
+  '「全部」是系统找到的所有候选；「保留」是还没被排除的（包括你点了保留的和还没审核的）；「排除」是你打了叉的。\n推荐：看完一遍后点「保留」再过一遍，这里的就是最终会导出的；还可以在「保留」里接着按球员标签、篮筐检测结果筛选，挑出要重点检查的。': "\"All\" is every candidate the app found; \"Kept\" is everything not excluded (candidates you kept plus ones you have not reviewed yet); \"Excluded\" is what you crossed out.\nTip: after one pass, open \"Kept\" and review it again - that is exactly what gets exported. Inside \"Kept\" you can keep filtering by player tag or rim check result to focus your checks.",
+  '想把所有片段统一加长或缩短，点这个按钮，设置每个进球「前」「后」各留几秒。只作用于当前列表里的候选（会随上面的筛选变化），默认不覆盖你手动调整过的片段。': "To lengthen or shorten every clip at once, click this and set how many seconds to keep before and after each goal. It applies only to the candidates in the current list (it follows the filters above) and by default does not overwrite clips you adjusted by hand.",
+  '补漏：系统漏掉的进球': "Add missed goals",
+  '先切到「原视频」，播放到漏掉的进球附近，再点「补漏片段」：会以当前位置作为进球时刻新建一个候选，在弹出的窗口里用 I / O 或拖动定好开始和结束，点「加入候选」即可。': "Switch to \"Original\", play to near the missed goal, then click \"Add missed clip\": a new candidate is created with the current position as the goal moment. In the window, set start and end with I / O or by dragging, then click \"Add to candidates\".",
+  '快捷键': "Shortcuts",
+  '分析队列已结束，有视频段没有分析成功，请在列表里查看': 'The analysis queue has finished, but some parts did not succeed - check the list',
+  '重新定位': 'Relink',
+  '本页新手引导': 'Guide for this page',
+  '重置新手引导': 'Reset onboarding guide',
+  '已重置，下次进入审核页和导出页会再次显示新手引导': 'Reset. The guide will show again next time you open Review and Export',
+  '这里看视频': 'Watch the clip here',
+  '这里是找到的候选': 'Candidates found for you',
+  '先选输出方式': 'Choose how to export',
+  '合并成一个视频，或每个片段单独导出；有球员标签时还能按标签各出一个。': 'Merge into one video, or export each clip separately; with player tags you can also get one video per tag.',
+  '点这里导出': 'Export from here',
+  '接着选保存位置，已排除的片段不会进入输出。导出在后台进行，期间可以回审核继续看；原视频不会被修改。': 'Next you pick where to save. Excluded clips are left out. Export runs in the background, so you can go back to Review; your original video is never changed.',
+  '视频画面准备较慢，已直接打开选择窗口': 'The video view was slow to get ready; opening the picker now',
   '导出任务未返回 id': 'The export task did not return an id',
   '检查视频输入': 'Check video input',
   '生成预览视频': 'Generate preview video',
@@ -1382,6 +1522,9 @@ const _englishText = <String, String>{
       'Click Feedback to copy diagnostics (version, system and logs) in one step, then send them to me. It makes problems much faster to fix.',
   '现在反馈': 'Report now',
   '版本': 'Version',
+  '开发版': 'Dev build',
+  '分析引擎版本': 'Analysis engine version',
+  '获取失败': 'Unavailable',
   '检查更新': 'Check for updates',
   '正在检查更新…': 'Checking for updates…',
   '重新检查': 'Check again',

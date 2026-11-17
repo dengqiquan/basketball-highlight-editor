@@ -6,7 +6,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:desktop/components/cs_button.dart';
+import 'package:desktop/core/video_orientation.dart';
 import 'package:desktop/features/export/export_screen.dart';
+import 'package:desktop/providers/onboarding_provider.dart';
 import 'package:desktop/providers/project_state.dart';
 import 'package:desktop/providers/playback_coordinator.dart';
 import 'package:desktop/providers/export_output_picker.dart';
@@ -55,7 +57,84 @@ void main() {
     }
   }
 
-  setUp(() => SharedPreferences.setMockInitialValues({}));
+  // 默认当作已看过引导，免得遮罩挡住别的用例；引导本身在专门的用例里测。
+  setUp(() {
+    resetVideoSurfaceHoldsForTest();
+    SharedPreferences.setMockInitialValues({
+      onboardingStepsPrefsKey: allOnboardingStepIds,
+    });
+  });
+
+  for (final locale in ['zh', 'en']) {
+    testWidgets('legacy source warning appears $locale', (tester) async {
+      tester.view.physicalSize = const Size(760, 1000);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(ProviderScope(
+        overrides: [projectProvider.overrideWith(() => _ExportNotifier(ProjectState(
+          exportHistory: [{'mode':'merge', 'output_path':'/tmp/out.mp4', 'metadata':{'source_unverified':true}}],
+        )))],
+        child: MaterialApp(locale: Locale(locale),
+          localizationsDelegates: BheLocalizations.localizationsDelegates,
+          supportedLocales: BheLocalizations.supportedLocales,
+          home: const Scaffold(body: ExportScreen())),
+      ));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('export-source-unverified')), findsOneWidget);
+      expect(find.text(locale == 'en' ? 'This project has no video fingerprint; the source content cannot be compared.' : '原项目没有视频指纹，无法比对原视频内容。'), findsOneWidget);
+    });
+  }
+
+  for (final locale in ['zh', 'en']) {
+    for (final stage in ['validate_source', 'verify_source']) {
+      testWidgets('export $stage shows elapsed and indeterminate $locale', (tester) async {
+        tester.view.physicalSize = const Size(900, 1000);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.reset);
+        final notifier = _CancelExportNotifier(ProjectState(
+          exportJob: {'id':'job-1', 'state':'running', 'stage':stage, 'progress':.4},
+        ));
+        await tester.pumpWidget(ProviderScope(
+          overrides: [projectProvider.overrideWith(() => notifier)],
+          child: MaterialApp(locale: Locale(locale),
+            localizationsDelegates: BheLocalizations.localizationsDelegates,
+            supportedLocales: BheLocalizations.supportedLocales,
+            home: const Scaffold(body: ExportScreen())),
+        ));
+        await tester.pump();
+        final stageLabel = stage == 'validate_source'
+            ? (locale == 'en' ? 'Checking source video' : '校验原视频')
+            : (locale == 'en' ? 'Rechecking source video' : '复核原视频');
+        expect(find.textContaining(stageLabel), findsOneWidget);
+        expect(find.byKey(const Key('export-elapsed')), findsOneWidget);
+        expect(tester.widget<LinearProgressIndicator>(find.byType(LinearProgressIndicator)).value, isNull);
+        expect(find.textContaining('40%'), findsNothing);
+        final cancel = find.text(locale == 'en' ? 'Cancel export' : '取消导出');
+        await tester.ensureVisible(cancel);
+        await tester.tap(cancel);
+        await tester.pump();
+        expect(notifier.cancelled, isTrue);
+        await tester.pumpWidget(const SizedBox());
+      });
+    }
+  }
+
+  testWidgets('unknown export disables start until task check resolves', (tester) async {
+    tester.view.physicalSize = const Size(900, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    final notifier = _UnconfirmedExportNotifier();
+    await tester.pumpWidget(ProviderScope(
+      overrides: [projectProvider.overrideWith(() => notifier)],
+      child: const MaterialApp(home: Scaffold(body: ExportScreen())),
+    ));
+    await tester.pumpAndSettle();
+    expect(tester.widget<CsButton>(find.byKey(const Key('export-start'))).onPressed, isNull);
+    expect(find.text('上一次导出启动结果未确认，请先查看导出任务'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('export-check-unknown')));
+    await tester.pumpAndSettle();
+    expect(tester.widget<CsButton>(find.byKey(const Key('export-start'))).onPressed, isNotNull);
+  });
 
   testWidgets('standalone merge opens beside return to review', (tester) async {
     await _pumpFilterExport(
@@ -367,11 +446,9 @@ void main() {
   });
 
   testWidgets(
-    'export waits for paused previews and prevents duplicate native dialogs',
+    'export hides video, opens the picker and prevents duplicate dialogs',
     (tester) async {
       final coordinator = PlaybackCoordinator();
-      final paused = Completer<void>();
-      coordinator.register(Object(), () => paused.future);
       final picker = _TestOutputPicker();
       final notifier = _TrackingExportNotifier();
       await _pumpExport(tester, coordinator, picker, notifier);
@@ -379,15 +456,14 @@ void main() {
       await tester.ensureVisible(merge);
       await tester.tap(merge);
       await tester.pump();
-      expect(picker.calls, 0);
       expect(tester.widget<CsButton>(merge).onPressed, isNull);
-      expect(find.text('正在准备输出位置…'), findsOneWidget);
-      paused.complete();
-      await tester.pump();
+      expect(find.text('请在弹出的窗口中选择保存位置'), findsOneWidget);
       await tester.pump();
       expect(picker.calls, 1);
+      expect(videoSurfaceHidden.value, isTrue);
       picker.result.complete(null);
       await tester.pumpAndSettle();
+      expect(videoSurfaceHidden.value, isFalse);
       expect(notifier.exports, isEmpty);
       expect(tester.widget<CsButton>(merge).onPressed, isNotNull);
       picker.result = Completer<String?>();
@@ -401,27 +477,146 @@ void main() {
     },
   );
 
-  testWidgets(
-    'failed pause never opens native dialog and leaves export retryable',
-    (tester) async {
-      final coordinator = PlaybackCoordinator();
-      coordinator.register(Object(), () async {
-        throw StateError('pause failed');
-      });
-      final picker = _TestOutputPicker();
-      final notifier = _TrackingExportNotifier();
-      await _pumpExport(tester, coordinator, picker, notifier);
-      final merge = find.byKey(const Key('export-start'));
-      await tester.ensureVisible(merge);
-      await tester.tap(merge);
-      await tester.pump();
-      await tester.pump();
-      expect(picker.calls, 0);
-      expect(notifier.exports, isEmpty);
-      expect(find.textContaining('选择输出位置失败'), findsOneWidget);
-      expect(tester.widget<CsButton>(merge).onPressed, isNotNull);
-    },
-  );
+  testWidgets('export page shows the onboarding guide once on first visit', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    final picker = _TestOutputPicker();
+    final notifier = _TrackingExportNotifier();
+    await _pumpExport(tester, PlaybackCoordinator(), picker, notifier);
+    await tester.pump();
+    expect(find.byKey(const Key('onboarding-overlay')), findsOneWidget);
+    expect(find.text('先选输出方式'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('onboarding-next')));
+    await tester.pump();
+    await tester.pump();
+    expect(find.text('点这里导出'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('onboarding-next')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('onboarding-overlay')), findsNothing);
+    expect(picker.calls, 0);
+    // 看过之后，导出按钮可以正常点。
+    final merge = find.byKey(const Key('export-start'));
+    await tester.ensureVisible(merge);
+    await tester.tap(merge);
+    await tester.pump();
+    await tester.pump();
+    expect(picker.calls, 1);
+  });
+
+  testWidgets('stuck frame still opens the picker and says so', (tester) async {
+    final stuck = Completer<void>();
+    final coordinator = PlaybackCoordinator(
+      prepareTimeout: const Duration(seconds: 10),
+      nextFrame: () => stuck.future,
+    );
+    final picker = _TestOutputPicker();
+    final notifier = _TrackingExportNotifier();
+    await _pumpExport(tester, coordinator, picker, notifier);
+    final merge = find.byKey(const Key('export-start'));
+    await tester.ensureVisible(merge);
+    await tester.tap(merge);
+    await tester.pump();
+    expect(picker.calls, 0);
+    await tester.pump(const Duration(seconds: 11));
+    expect(picker.calls, 1);
+    expect(find.text('视频画面准备较慢，已直接打开选择窗口'), findsOneWidget);
+    picker.result.complete(null);
+    await tester.pumpAndSettle();
+    expect(tester.widget<CsButton>(merge).onPressed, isNotNull);
+  });
+
+  testWidgets('picker failure leaves export retryable', (tester) async {
+    final picker = _TestOutputPicker()..failure = StateError('picker failed');
+    final notifier = _TrackingExportNotifier();
+    await _pumpExport(tester, PlaybackCoordinator(), picker, notifier);
+    final merge = find.byKey(const Key('export-start'));
+    await tester.ensureVisible(merge);
+    await tester.tap(merge);
+    await tester.pump();
+    await tester.pump();
+    expect(notifier.exports, isEmpty);
+    expect(find.textContaining('选择输出位置失败'), findsOneWidget);
+    expect(tester.widget<CsButton>(merge).onPressed, isNotNull);
+    expect(videoSurfaceHidden.value, isFalse);
+  });
+
+  testWidgets('picker opens while an unrelated pause remains stuck and restores the surface', (tester) async {
+    final player = _HungPausePlayer();
+    unawaited(player.pause());
+    final picker = _TestOutputPicker();
+    final notifier = _TrackingExportNotifier();
+    await tester.pumpWidget(ProviderScope(
+      overrides: [
+        projectProvider.overrideWith(() => notifier),
+        playbackCoordinatorProvider.overrideWithValue(PlaybackCoordinator()),
+        exportOutputPickerProvider.overrideWithValue(picker),
+      ],
+      child: MaterialApp(home: Scaffold(body: Stack(children: [
+        const ExportScreen(),
+        IgnorePointer(child: ValueListenableBuilder<bool>(
+          valueListenable: videoSurfaceHidden,
+          builder: (_, hidden, _) => Text(hidden ? 'video placeholder' : 'video surface'),
+        )),
+      ]))),
+    ));
+    await tester.pumpAndSettle();
+    expect(find.text('video surface'), findsOneWidget);
+    final start = find.byKey(const Key('export-start'));
+    await tester.ensureVisible(start);
+    await tester.tap(start);
+    await tester.pump();
+    await tester.pump();
+    expect(picker.calls, 1);
+    expect(player.pauseCalls, 1);
+    expect(player.pauseFinished, isFalse);
+    expect(find.text('video placeholder'), findsOneWidget);
+    picker.result.complete(null);
+    await tester.pumpAndSettle();
+    expect(find.text('video surface'), findsOneWidget);
+    expect(tester.widget<CsButton>(start).onPressed, isNotNull);
+  });
+
+  testWidgets('diagnostic failures cannot block or strand picker', (tester) async {
+    final picker = _TestOutputPicker();
+    await tester.pumpWidget(ProviderScope(
+      overrides: [
+        projectProvider.overrideWith(_TrackingExportNotifier.new),
+        exportOutputPickerProvider.overrideWithValue(picker),
+        exportDialogLogProvider.overrideWithValue((_, _, _) => throw StateError('log failed')),
+      ],
+      child: const MaterialApp(home: Scaffold(body: ExportScreen())),
+    ));
+    await tester.pumpAndSettle();
+    final start = find.byKey(const Key('export-start'));
+    await tester.ensureVisible(start);
+    await tester.tap(start);
+    await tester.pump();
+    await tester.pump();
+    expect(picker.calls, 1);
+    picker.result.complete(null);
+    await tester.pumpAndSettle();
+    expect(tester.widget<CsButton>(start).onPressed, isNotNull);
+    expect(videoSurfaceHidden.value, isFalse);
+  });
+
+  testWidgets('provider failure resets the export button', (tester) async {
+    await tester.pumpWidget(ProviderScope(
+      overrides: [
+        projectProvider.overrideWith(_TrackingExportNotifier.new),
+        playbackCoordinatorProvider.overrideWith((ref) => throw StateError('provider failed')),
+      ],
+      child: const MaterialApp(home: Scaffold(body: ExportScreen())),
+    ));
+    await tester.pumpAndSettle();
+    final start = find.byKey(const Key('export-start'));
+    await tester.ensureVisible(start);
+    await tester.tap(start);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('选择输出位置失败'), findsOneWidget);
+    expect(tester.widget<CsButton>(start).onPressed, isNotNull);
+    expect(videoSurfaceHidden.value, isFalse);
+  });
 
   testWidgets('separate export uses the same paused native-dialog path', (
     tester,
@@ -442,6 +637,33 @@ void main() {
     await tester.pumpAndSettle();
     expect(notifier.exports, ['separate:/tmp/clips']);
   });
+
+  for (final locale in ['zh', 'en']) {
+    testWidgets('export color warning is visible $locale', (tester) async {
+      tester.view.physicalSize = const Size(1000, 1000);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(ProviderScope(
+        overrides: [projectProvider.overrideWith(() => _ExportNotifier(
+          const ProjectState(exportHistory: [{
+            'mode': 'merge', 'candidate_count': 1, 'output_path': '/tmp/out.mp4',
+            'metadata': {'color_warnings': ['HDR 色调映射不可用，画面可能偏亮']},
+          }]),
+        ))],
+        child: MaterialApp(
+          locale: Locale(locale),
+          localizationsDelegates: BheLocalizations.localizationsDelegates,
+          supportedLocales: BheLocalizations.supportedLocales,
+          home: const Scaffold(body: ExportScreen()),
+        ),
+      ));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('export-color-warning')), findsOneWidget);
+      expect(find.text(locale == 'en'
+          ? 'HDR tone mapping is unavailable; the video may look too bright.'
+          : 'HDR 色调映射不可用，画面可能偏亮'), findsOneWidget);
+    });
+  }
 
   testWidgets('导出历史提供打开目录按钮', (tester) async {
     await tester.pumpWidget(
@@ -646,16 +868,30 @@ Future<void> _pumpExport(
 class _TestOutputPicker extends ExportOutputPicker {
   var result = Completer<String?>();
   var calls = 0;
+  Object? failure;
   @override
-  Future<String?> mergedPath({required String typeLabel}) {
+  Future<String?> mergedPath({required String typeLabel, String projectName = 'Project'}) {
     calls++;
+    if (failure != null) throw failure!;
     return result.future;
   }
 
   @override
   Future<String?> directory({required String confirmLabel}) {
     calls++;
+    if (failure != null) throw failure!;
     return result.future;
+  }
+}
+
+class _HungPausePlayer {
+  final _pending = Completer<void>();
+  int pauseCalls = 0;
+  bool pauseFinished = false;
+  Future<void> pause() async {
+    pauseCalls++;
+    await _pending.future;
+    pauseFinished = true;
   }
 }
 
@@ -680,5 +916,24 @@ class _TrackingExportNotifier extends _ExportNotifier {
     String? referencePlayerId,
   }) async {
     exports.add('$mode:${outputPath ?? outputDir}');
+  }
+}
+
+class _CancelExportNotifier extends _ExportNotifier {
+  _CancelExportNotifier(super.initialState);
+  bool cancelled = false;
+  @override
+  Future<void> cancelExport() async { cancelled = true; }
+}
+
+class _UnconfirmedExportNotifier extends ProjectNotifier {
+  @override
+  ProjectState build() => const ProjectState(
+    exportStartUnconfirmed: true,
+    candidates: [{'id':'c1', 'default_start_ms':0, 'default_end_ms':1000}],
+  );
+  @override
+  Future<void> checkUnconfirmedExport() async {
+    state = state.copyWith(exportStartUnconfirmed: false, exportJob: {'id':'found', 'state':'completed'});
   }
 }

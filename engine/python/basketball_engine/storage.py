@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable
 from uuid import uuid4
 
+from .request_control import fingerprint
+
 # Same value as basketball_highlight.rim_check.AUTO_REVIEW_REASON.
 AUTO_REVIEW_REASON = "auto_rim_check"
 
@@ -145,10 +147,8 @@ class ProjectStore:
                 connection.execute(f"ALTER TABLE candidate_reviews ADD COLUMN {name} {definition}")
 
     def connect(self) -> sqlite3.Connection:
-        if not self.db_path.exists():
-            self.initialize()
         connection = sqlite3.connect(
-            self.db_path, timeout=30.0, factory=_ClosingConnection
+            self.db_path.as_uri() + '?mode=rw', uri=True, timeout=30.0, factory=_ClosingConnection
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -393,11 +393,7 @@ class ProjectStore:
     def _source_fingerprint(path: str | Path) -> str | None:
         source = Path(path)
         try:
-            digest = hashlib.sha256()
-            with source.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            return f"{source.stat().st_size}:{digest.hexdigest()}"
+            return fingerprint(source)
         except OSError:
             return None
 
@@ -704,7 +700,13 @@ class ProjectStore:
         )
         return candidate
 
-    def replace_candidates(self, video_id: str, rows: list[Dict[str, Any]]) -> None:
+    def replace_candidates(
+        self,
+        video_id: str,
+        rows: list[Dict[str, Any]],
+        before_commit=None,
+    ) -> None:
+        """替换候选。`before_commit` 在同一个事务里、提交之前调用：它抛异常整个替换回滚。"""
         timestamp = now_iso()
         with self.connect() as connection:
             video_row = connection.execute(
@@ -853,6 +855,8 @@ class ProjectStore:
                         timestamp,
                     ),
                 )
+            if before_commit is not None:
+                before_commit()
 
     def list_players(self) -> list[Dict[str, Any]]:
         project = self.project()
@@ -1193,17 +1197,19 @@ class ProjectStore:
             "total": len(rows),
         }
 
-    def create_job(self, project_id: str, video_id: str | None, job_type: str, checkpoint: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def create_job(self, project_id: str, video_id: str | None, job_type: str, checkpoint: Dict[str, Any] | None = None, *, connection=None) -> Dict[str, Any]:
+        if connection is None:
+            with self.connect() as connection:
+                return self.create_job(project_id, video_id, job_type, checkpoint, connection=connection)
         job_id = new_id("job")
         timestamp = now_iso()
-        with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO jobs (id, project_id, video_id, type, state, stage, checkpoint_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'queued', 'validate_input', ?, ?, ?)
-                """,
-                (job_id, project_id, video_id, job_type, json.dumps(checkpoint or {}, ensure_ascii=False), timestamp, timestamp),
-            )
+        connection.execute(
+            """
+            INSERT INTO jobs (id, project_id, video_id, type, state, stage, checkpoint_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'queued', 'validate_input', ?, ?, ?)
+            """,
+            (job_id, project_id, video_id, job_type, json.dumps(checkpoint or {}, ensure_ascii=False), timestamp, timestamp),
+        )
         return {"id": job_id, "state": "queued", "stage": "validate_input", "progress": 0.0}
 
     def get_job(self, job_id: str) -> Dict[str, Any] | None:
@@ -1265,7 +1271,13 @@ class ProjectStore:
                 fields.append("finished_at = COALESCE(finished_at, ?)")
                 values.append(now_iso())
         if stage is not None:
-            fields.append("stage = ?")
+            # 已进入取消收尾的任务保留 cancelling 显示，不被后续进度写入盖回普通阶段。
+            if state is None or state == "running":
+                fields.append(
+                    "stage = CASE WHEN stage = 'cancelling' THEN stage ELSE ? END"
+                )
+            else:
+                fields.append("stage = ?")
             values.append(stage)
         if progress is not None:
             fields.append("progress = ?")
@@ -1372,40 +1384,57 @@ class ProjectStore:
                 "export_file_size_bytes": exports["file_size_bytes"],
             }
 
-    def create_export(self, values: Dict[str, Any]) -> Dict[str, Any]:
+    def create_export(self, values: Dict[str, Any], *, connection=None) -> Dict[str, Any]:
+        if connection is None:
+            with self.connect() as connection:
+                return self.create_export(values, connection=connection)
         export_id = values.get("id") or new_id("export")
         timestamp = now_iso()
-        with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO exports (
-                    id, project_id, video_id, output_path, mode, candidate_count,
-                    duration_ms, file_size_bytes, width, height, video_codec,
-                    audio_codec, processing_ms, export_ms, algorithm_version,
-                    metadata_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    export_id,
-                    values["project_id"],
-                    values.get("video_id"),
-                    values["output_path"],
-                    values["mode"],
-                    int(values.get("candidate_count", 0)),
-                    values.get("duration_ms"),
-                    values.get("file_size_bytes"),
-                    values.get("width"),
-                    values.get("height"),
-                    values.get("video_codec"),
-                    values.get("audio_codec"),
-                    values.get("processing_ms"),
-                    values.get("export_ms"),
-                    values.get("algorithm_version", "python-v1"),
-                    json.dumps(values.get("metadata", {}), ensure_ascii=False),
-                    timestamp,
-                ),
-            )
+        connection.execute(
+            """
+            INSERT INTO exports (
+                id, project_id, video_id, output_path, mode, candidate_count,
+                duration_ms, file_size_bytes, width, height, video_codec,
+                audio_codec, processing_ms, export_ms, algorithm_version,
+                metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                export_id,
+                values["project_id"],
+                values.get("video_id"),
+                values["output_path"],
+                values["mode"],
+                int(values.get("candidate_count", 0)),
+                values.get("duration_ms"),
+                values.get("file_size_bytes"),
+                values.get("width"),
+                values.get("height"),
+                values.get("video_codec"),
+                values.get("audio_codec"),
+                values.get("processing_ms"),
+                values.get("export_ms"),
+                values.get("algorithm_version", "python-v1"),
+                json.dumps(values.get("metadata", {}), ensure_ascii=False),
+                timestamp,
+            ),
+        )
         return {"id": export_id, **values, "created_at": timestamp}
+
+    def complete_export_job(self, values: Dict[str, Any], job_id: str, checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+        """Publish history and completed state together in one database transaction."""
+        with self.connect() as connection:
+            export = self.create_export(values, connection=connection)
+            stamp = now_iso()
+            cursor = connection.execute(
+                "UPDATE jobs SET state='completed', stage='persist_export', progress=1.0, "
+                "checkpoint_json=?, updated_at=?, finished_at=COALESCE(finished_at, ?) "
+                "WHERE id=? AND state IN ('queued','running')",
+                (json.dumps({**checkpoint, 'export': export, 'files': values['metadata']['files']}, ensure_ascii=False), stamp, stamp, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("EXPORT_JOB_NOT_ACTIVE")
+            return export
 
     def list_exports(self, project_id: str, limit: int = 20) -> list[Dict[str, Any]]:
         if limit <= 0 or limit > 100:

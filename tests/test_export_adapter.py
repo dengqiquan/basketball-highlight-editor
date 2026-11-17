@@ -125,6 +125,9 @@ def test_clip_command_rejects_invalid_range():
 
 @pytest.mark.parametrize("mode", ["separate", "merge"])
 def test_export_without_h264_encoders_falls_back_for_clips_and_merge(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(export, '_audio_layouts', lambda paths: [None] * len(paths))
+    monkeypatch.setattr(export, '_uniform_frame_rate', lambda paths: None)
+    monkeypatch.setattr(export, '_merged_duration_ok', lambda *a, **k: True)
     monkeypatch.setattr(export.platform, "system", lambda: "Linux")
     attempts = []
 
@@ -166,7 +169,12 @@ def test_hardware_encoders_get_a_bitrate():
 
 @pytest.mark.parametrize("mode", ["separate", "merge"])
 def test_windows_tries_gpu_encoders_and_keeps_the_one_that_works(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(export, '_audio_layouts', lambda paths: [None] * len(paths))
+    monkeypatch.setattr(export, '_uniform_frame_rate', lambda paths: None)
+    monkeypatch.setattr(export, '_merged_duration_ok', lambda *a, **k: True)
     monkeypatch.setattr(export.platform, "system", lambda: "Windows")
+    # The fake clip bytes below cannot be probed; this test exercises codec fallback.
+    monkeypatch.setattr(export, "_compatible_color_streams", lambda paths: True)
     attempts = []
 
     def fake_ffmpeg(command, output_path, **kwargs):
@@ -519,6 +527,9 @@ def test_validate_output_file_rejects_a_directory_target(tmp_path: Path):
 
 
 def test_merge_writes_mp4_when_the_saved_name_has_no_extension(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(export, '_audio_layouts', lambda paths: [None] * len(paths))
+    monkeypatch.setattr(export, '_uniform_frame_rate', lambda paths: None)
+    monkeypatch.setattr(export, '_merged_duration_ok', lambda *a, **k: True)
     def fake_ffmpeg(command, output_path, **kwargs):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"video")
@@ -600,3 +611,213 @@ def test_media_command_error_prints_a_signed_windows_exit_code():
     message = str(export.MediaCommandError(4294967274, ["ffmpeg"], "Invalid argument"))
     assert "-22" in message
     assert "4294967274" not in message
+
+
+def _fps_source(tmp_path: Path, name: str, rate: str, timescale: int) -> Path:
+    ffmpeg, _ = _ffmpeg_or_skip()
+    source = tmp_path / f"{name}.mp4"
+    subprocess.run(
+        [
+            ffmpeg, "-v", "error", "-y",
+            "-f", "lavfi", "-i", f"testsrc=size=640x360:rate={rate}",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+            "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-video_track_timescale", str(timescale), "-c:a", "aac", str(source),
+        ],
+        check=True,
+    )
+    return source
+
+
+def _stream_durations(path: str) -> dict[str, float]:
+    _, ffprobe = _ffmpeg_or_skip()
+    rows = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,duration", "-of", "csv=p=0", path],
+        check=True, capture_output=True, text=True,
+    ).stdout.split()
+    return {row.split(",")[0]: float(row.split(",")[1]) for row in rows}
+
+
+def _mixed_rate_candidates(tmp_path: Path, with_fps: bool):
+    sources = [
+        (_fps_source(tmp_path, "s60a", "60", 600), 60.0),
+        (_fps_source(tmp_path, "s60b", "60", 600), 60.0),
+        (_fps_source(tmp_path, "s5994", "60000/1001", 60000), 59.94),
+    ]
+    return [
+        {
+            "source_path": str(source), "event_time_ms": 600, "review_start_ms": 100, "review_end_ms": 1100,
+            "width": 640, "height": 360, "has_audio": True, **({"fps": fps} if with_fps else {}),
+        }
+        for source, fps in sources
+    ]
+
+
+@pytest.mark.parametrize("with_fps", [True, False])
+def test_merge_of_mixed_frame_rates_keeps_the_summed_duration(tmp_path: Path, with_fps):
+    # 60 + 60 + 59.94 帧各 1 秒：成品必须约 3 秒，不能被拉长（用户反馈 3 秒变 11.75 秒）。
+    candidates = _mixed_rate_candidates(tmp_path, with_fps)
+    result = export.export_goal_clips(
+        candidates, tmp_path / "out", "merge", output_path=tmp_path / "out" / "final.mp4",
+    )
+    durations = _stream_durations(result["files"][0])
+    assert durations["video"] == pytest.approx(3.0, abs=0.1)
+    assert durations["audio"] == pytest.approx(3.0, abs=0.1)
+
+
+def test_merge_of_same_frame_rate_keeps_the_stream_copy_fast_path(tmp_path: Path, monkeypatch):
+    candidates = _mixed_rate_candidates(tmp_path, True)[:2]
+    commands = []
+    real_run = export.run_encoded_ffmpeg
+
+    def spy(builder, output_path, codecs, **kwargs):
+        codec = real_run(builder, output_path, codecs, **kwargs)
+        commands.append(builder(codec))
+        return codec
+
+    monkeypatch.setattr(export, "run_encoded_ffmpeg", spy)
+    export.export_goal_clips(candidates, tmp_path / "out", "merge", output_path=tmp_path / "out" / "final.mp4")
+    assert len(commands) == 2  # 只有逐段编码，没有合并时的重编码
+    assert all("-r" not in command for command in commands)
+
+
+def test_merge_never_touches_a_concat_txt_from_the_user(tmp_path: Path, monkeypatch):
+    # 输出目录是用户自己选的文件夹，「每个标签各合成一个」和「合并成一个」都往这里写；
+    # 里面原有的 concat.txt 是用户的文件，不能被覆盖，也不能留在导出目录里。
+    candidates = _mixed_rate_candidates(tmp_path, True)[:2]
+    out = tmp_path / "out"
+    out.mkdir()
+    user_manifest = out / "concat.txt"
+    user_manifest.write_text("file 'mine.mp4'\n", encoding="utf-8")
+    commands = []
+    real_run = export.run_atomic_ffmpeg
+
+    def spy(command, output_path, **kwargs):
+        commands.append(list(command))
+        return real_run(command, output_path, **kwargs)
+
+    monkeypatch.setattr(export, "run_atomic_ffmpeg", spy)
+    final = out / "final.mp4"
+    export.export_goal_clips(candidates, out, "merge", output_path=final)
+
+    assert user_manifest.read_text(encoding="utf-8") == "file 'mine.mp4'\n"
+    assert list(out.glob(".bhe-concat-*")) == []
+    merge_command = next(command for command in commands if "concat" in command)
+    manifest_index = merge_command.index("-i") + 1
+    manifest = Path(merge_command[manifest_index])
+    assert manifest.parent == out
+    assert manifest.name.startswith(".bhe-concat-") and manifest.suffix == ".txt"
+    # 除清单路径外，快路径参数与修复前一致。
+    assert [part for index, part in enumerate(merge_command) if index != manifest_index] == [
+        merge_command[0], "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", "-c", "copy", str(final),
+    ]
+
+
+def test_frame_rate_is_unified_only_when_clips_differ():
+    clip = {"fps": 59.94006}
+    assert export._merge_frame_rate([{"fps": 60.0}, clip], {"fps": 60.0}) is None
+    assert export._merge_frame_rate([{"fps": 60.0}, clip], clip) == "60/1"
+    assert export._merge_frame_rate([clip, {"fps": 60.0}], {"fps": 60.0}) == "60000/1001"
+    assert export._merge_frame_rate([{"fps": 60.0}], {}) is None
+    command = build_clip_command(Path("s.mp4"), 0, 1000, Path("o.mp4"), "libx264", frame_rate="60/1")
+    assert command[-3:] == ["-r", "60/1", "o.mp4"]
+    assert "-r" not in build_clip_command(Path("s.mp4"), 0, 1000, Path("o.mp4"), "libx264")
+
+
+def test_validate_media_file_retries_only_timeout(tmp_path, monkeypatch):
+    import subprocess
+    from engine.python.basketball_engine.adapters import export
+
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"video")
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(kwargs["timeout"])
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, stdout="2.5\n")
+
+    monkeypatch.setattr(export.subprocess, "run", run)
+    export.validate_media_file(path)
+    assert calls == [15, 60]
+
+
+def test_validate_media_file_does_not_accept_repeated_timeout_or_invalid_result(tmp_path, monkeypatch):
+    import subprocess
+    from engine.python.basketball_engine.adapters import export
+
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"video")
+    calls = []
+
+    def timeout(command, **kwargs):
+        calls.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(export.subprocess, "run", timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        export.validate_media_file(path)
+    assert calls == [15, 60]
+    monkeypatch.setattr(export.subprocess, "run", lambda command, **kw: subprocess.CompletedProcess(command, 0, stdout="0\n"))
+    with pytest.raises(OSError):
+        export.validate_media_file(path)
+
+
+def test_probe_retry_succeeds_before_atomic_publish(tmp_path, monkeypatch):
+    import subprocess
+    from engine.python.basketball_engine.adapters import export
+
+    output = tmp_path / "clip.mp4"
+    output.write_bytes(b"existing")
+    calls = []
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, command, **_kwargs):
+            Path(command[-1]).write_bytes(b"new video")
+
+        def poll(self):
+            return 0
+
+    def probe(command, **kwargs):
+        calls.append(kwargs["timeout"])
+        assert output.read_bytes() == b"existing"
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, stdout="5\n")
+
+    monkeypatch.setattr(export.subprocess, "Popen", Process)
+    monkeypatch.setattr(export.subprocess, "run", probe)
+    export.run_atomic_ffmpeg(["ffmpeg", str(output)], output)
+    assert calls == [15, 60]
+    assert output.read_bytes() == b"new video"
+
+
+def test_probe_timeout_never_replaces_existing_output(tmp_path, monkeypatch):
+    import subprocess
+    from engine.python.basketball_engine.adapters import export
+
+    output = tmp_path / "clip.mp4"
+    output.write_bytes(b"existing")
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, command, **_kwargs):
+            Path(command[-1]).write_bytes(b"new video")
+
+        def poll(self):
+            return 0
+
+    def timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(export.subprocess, "Popen", Process)
+    monkeypatch.setattr(export.subprocess, "run", timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        export.run_atomic_ffmpeg(["ffmpeg", str(output)], output)
+    assert output.read_bytes() == b"existing"
+    assert not list(tmp_path.glob("*.part*"))

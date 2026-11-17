@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import '../core/app_log.dart';
+import 'engine_client.dart' show EngineException;
 import 'engine_session.dart';
 
 String canonicalProjectPath(String path) {
@@ -51,7 +53,11 @@ class ProjectSessionScope {
     required this.projectRoot,
     this.projectId,
     this.videoId,
+    this.isCancelled,
   });
+
+  /// 会话已被替换/页面已销毁时返回 true，重试循环据此提前收手。
+  final bool Function()? isCancelled;
 
   final EngineSession engine;
   final String projectRoot;
@@ -59,10 +65,14 @@ class ProjectSessionScope {
   final String? videoId;
 
   Future<JsonMap> extractPreview({int timeMs = 1000}) {
-    return engine.extractPreview(
-      projectRoot: projectRoot,
-      videoId: _requireVideoId(),
-      timeMs: timeMs,
+    return retryWhileProjectBusy(
+      'extract_preview',
+      () => engine.extractPreview(
+        projectRoot: projectRoot,
+        videoId: _requireVideoId(),
+        timeMs: timeMs,
+      ),
+      isCancelled: isCancelled,
     );
   }
 
@@ -188,6 +198,51 @@ class ProjectSessionScope {
   }
 }
 
+/// 项目忙（`PROJECT_BUSY`）是临时状态：打开项目、生成预览代理的几秒里，
+/// 同一项目的读请求会被引擎直接拒掉。这里静默重试，避免用户一进审核页
+/// 就连续收到「视频预览加载失败」「开始记录审核耗时失败」两个错误通知。
+///
+/// 只用于读操作（取预览、开始记录审核耗时），不会重放会改数据的命令。
+const projectBusyRetryDelays = <Duration>[
+  Duration(milliseconds: 300),
+  Duration(milliseconds: 700),
+  Duration(milliseconds: 1500),
+  Duration(milliseconds: 3000),
+  Duration(milliseconds: 4000),
+  Duration(milliseconds: 5500),
+];
+
+Future<JsonMap> retryWhileProjectBusy(
+  String command,
+  Future<JsonMap> Function() request, {
+  List<Duration> delays = projectBusyRetryDelays,
+  bool Function()? isCancelled,
+}) async {
+  for (var attempt = 0; ; attempt++) {
+    try {
+      final result = await request();
+      if (attempt > 0) {
+        appLog('info', 'project', '$command 项目忙，第 ${attempt + 1} 次尝试成功');
+      }
+      return result;
+    } on EngineException catch (error) {
+      // 「项目正在导出」也复用 PROJECT_BUSY，但导出可能要几分钟，重试没有意义。
+      if (!_isRetryableBusy(error) || attempt >= delays.length) rethrow;
+      await Future<void>.delayed(delays[attempt]);
+      if (isCancelled?.call() ?? false) {
+        appLog('info', 'project', '$command 项目忙，页面已失效，停止重试');
+        rethrow;
+      }
+    }
+  }
+}
+
+/// 只有「项目正在读取/请求排队」才值得重试；导出占用和引擎关闭都不重试。
+bool _isRetryableBusy(EngineException error) {
+  if (error.code != 'PROJECT_BUSY') return false;
+  return !error.message.contains('导出');
+}
+
 List<JsonMap> _mapList(Object? raw) {
   if (raw is! List) return <JsonMap>[];
   return raw
@@ -204,6 +259,7 @@ class ProjectSession {
   String? _projectRoot;
   String? _projectId;
   String? _videoId;
+  int _sessionRevision = 0;
 
   String? get projectRoot => _projectRoot;
   String? get projectId => _projectId;
@@ -216,6 +272,7 @@ class ProjectSession {
   );
 
   void restore(ProjectSessionCheckpoint checkpoint) {
+    _sessionRevision++;
     _projectRoot = checkpoint.projectRoot;
     _projectId = checkpoint.projectId;
     _videoId = checkpoint.videoId;
@@ -242,12 +299,14 @@ class ProjectSession {
     String? projectId,
     String language = 'zh-CN',
   }) async {
+    final revision = ++_sessionRevision;
     final payload = await engine.createProject(
       name: name,
       rootPath: rootPath,
       projectId: projectId,
       language: language,
     );
+    if (revision != _sessionRevision) return payload;
     _projectRoot = canonicalProjectPath(
       (payload['project'] as Map?)?['root_path']?.toString() ?? rootPath,
     );
@@ -257,7 +316,9 @@ class ProjectSession {
   }
 
   Future<JsonMap> openProject(String projectRoot) async {
+    final revision = ++_sessionRevision;
     final payload = await engine.openProject(projectRoot: projectRoot);
+    if (revision != _sessionRevision) return payload;
     final project = payload['project'];
     final video = payload['video'];
     _projectRoot = canonicalProjectPath(
@@ -317,7 +378,10 @@ class ProjectSession {
   }
 
   /// 切换当前操作的视频段，项目内的多段视频共用一个会话。
-  void setActiveVideo(String videoId) => _videoId = videoId;
+  void setActiveVideo(String videoId) {
+    _sessionRevision++;
+    _videoId = videoId;
+  }
 
   /// 把视频追加到项目末尾，不改变当前操作的视频段。
   Future<JsonMap> addVideo(String videoPath) {
@@ -349,11 +413,14 @@ class ProjectSession {
 
   Future<JsonMap> linkVideo(String videoPath) async {
     final root = _requireProjectRoot();
+    final revision = _sessionRevision;
     final payload = await engine.linkVideo(
       projectRoot: root,
       videoPath: videoPath,
     );
-    _videoId = _nestedId(payload, 'video');
+    if (revision == _sessionRevision && root == _projectRoot) {
+      _videoId = _nestedId(payload, 'video');
+    }
     return payload;
   }
 
@@ -368,10 +435,18 @@ class ProjectSession {
   }
 
   Future<JsonMap> extractPreview({int timeMs = 1000, String? videoId}) {
-    return engine.extractPreview(
-      projectRoot: _requireProjectRoot(),
-      videoId: videoId ?? _requireVideoId(),
-      timeMs: timeMs,
+    final root = _requireProjectRoot();
+    final targetVideoId = videoId ?? _requireVideoId();
+    final revision = _sessionRevision;
+    return retryWhileProjectBusy(
+      'extract_preview',
+      () => engine.extractPreview(
+        projectRoot: root,
+        videoId: targetVideoId,
+        timeMs: timeMs,
+      ),
+      // 重试途中切了项目/换了视频就不要再重试旧项目。
+      isCancelled: () => _sessionRevision != revision,
     );
   }
 
@@ -604,10 +679,16 @@ class ProjectSession {
   }
 
   Future<JsonMap> startReview(String candidateId, {String? reviewStartedAt}) {
-    return engine.startReview(
-      projectRoot: _requireProjectRoot(),
-      candidateId: candidateId,
-      reviewStartedAt: reviewStartedAt,
+    final root = _requireProjectRoot();
+    final revision = _sessionRevision;
+    return retryWhileProjectBusy(
+      'start_review',
+      () => engine.startReview(
+        projectRoot: root,
+        candidateId: candidateId,
+        reviewStartedAt: reviewStartedAt,
+      ),
+      isCancelled: () => _sessionRevision != revision,
     );
   }
 
@@ -702,9 +783,13 @@ class ProjectSession {
         .toList();
   }
 
-  void clearVideo() => _videoId = null;
+  void clearVideo() {
+    _sessionRevision++;
+    _videoId = null;
+  }
 
   void reset() {
+    _sessionRevision++;
     _projectRoot = null;
     _projectId = null;
     _videoId = null;

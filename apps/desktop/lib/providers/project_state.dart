@@ -1,10 +1,13 @@
 // lib/providers/project_state.dart
+import '../core/app_diagnostics.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
+import 'package:bhe_core/bhe_core.dart';
 import 'package:flutter/widgets.dart' show Rect;
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -16,8 +19,10 @@ import '../core/video_segments.dart';
 import 'notice_provider.dart';
 import 'session_provider.dart';
 import 'sidebar_provider.dart';
+import '../core/app_log.dart';
+import '../core/draft_flush_registry.dart';
 
-const _recentProjectRootsKey = 'basketball_recent_project_roots';
+const recentProjectRootsPrefsKey = 'basketball_recent_project_roots';
 
 /// 项目显示名的长度上限。只约束数据库里的 name，不影响磁盘目录名。
 const projectNameMaxLength = 60;
@@ -104,7 +109,10 @@ class ProjectState {
     this.queueBeforeSeconds = 3,
     this.queueAfterSeconds = 1,
     this.queuePaused = false,
+    this.queueFinishedCount = 0,
+    this.lastQueueAllCompleted = false,
     this.exportQueued = false,
+    this.exportStartUnconfirmed = false,
   });
 
   final JsonMap? video;
@@ -146,8 +154,15 @@ class ProjectState {
   final double queueAfterSeconds;
   final bool queuePaused;
 
+  /// 多段分析队列整体跑完的次数（只增不减），界面据此在分析全部结束后跳到审核页。
+  final int queueFinishedCount;
+
+  /// 最近一次队列跑完时，本次排队的每一段是否都分析成功（有失败/取消则为 false）。
+  final bool lastQueueAllCompleted;
+
   /// 队列分析时点了导出：等当前这段分析完先导出，再继续排队。
   final bool exportQueued;
+  final bool exportStartUnconfirmed;
 
   bool get multiVideo => videos.length > 1;
 
@@ -200,7 +215,10 @@ class ProjectState {
     double? queueBeforeSeconds,
     double? queueAfterSeconds,
     bool? queuePaused,
+    int? queueFinishedCount,
+    bool? lastQueueAllCompleted,
     bool? exportQueued,
+    bool? exportStartUnconfirmed,
     List<JsonMap>? candidates,
     List<JsonMap>? players,
     List<JsonMap>? recentProjects,
@@ -276,7 +294,10 @@ class ProjectState {
       queueBeforeSeconds: queueBeforeSeconds ?? this.queueBeforeSeconds,
       queueAfterSeconds: queueAfterSeconds ?? this.queueAfterSeconds,
       queuePaused: queuePaused ?? this.queuePaused,
+      queueFinishedCount: queueFinishedCount ?? this.queueFinishedCount,
+      lastQueueAllCompleted: lastQueueAllCompleted ?? this.lastQueueAllCompleted,
       exportQueued: exportQueued ?? this.exportQueued,
+      exportStartUnconfirmed: exportStartUnconfirmed ?? this.exportStartUnconfirmed,
     );
   }
 }
@@ -314,6 +335,19 @@ class _ReviewBaseline {
 /// - `_section = AppSection.x` 不迁移(由 router 负责)
 /// - `_error = ...` 不迁移(由 notice 替代)
 class ProjectNotifier extends Notifier<ProjectState> {
+  /// 本次排队里各视频段的分析结果（视频段 id → completed/failed/cancelled）。
+  final Map<String, String> _queueOutcomes = <String, String>{};
+
+  @override
+  bool updateShouldNotify(ProjectState previous, ProjectState next) {
+    // 换了当前视频就记一行它的规格，反馈时能看出是什么样的视频（分辨率、帧率、编码、时长）。
+    final id = next.video?['id'];
+    if (id != null && id != previous.video?['id']) {
+      appLog('info', 'video', '当前视频 ${describeVideoForLog(next.video)}');
+    }
+    return super.updateShouldNotify(previous, next);
+  }
+
   final List<_ReviewSnapshot> _reviewHistory = <_ReviewSnapshot>[];
   final Set<String> _pollingJobIds = <String>{};
   final Set<String> _pollingExportJobIds = <String>{};
@@ -351,19 +385,34 @@ class ProjectNotifier extends Notifier<ProjectState> {
   }
 
   Future<void> selectVideo(String path) async {
+    appLog('info', 'import', '导入开始');
     await flushReviewQueue();
     var projectCreatedForRecent = false;
     await _runBusy(
       () async {
         final generation = ++_projectLoadGeneration;
         await ref.read(engineBootstrapProvider.notifier).ensure();
+        if (_disposed || generation != _projectLoadGeneration) return;
+        // 新建项目同样会换会话身份，先等导入页把当前草稿写给原项目。
+        await flushDraftBeforeShutdown();
+        if (_disposed || generation != _projectLoadGeneration) return;
         final session = ref.read(projectSessionProvider);
         final checkpoint = session.checkpoint();
         final source = File(path).absolute;
-        final stem = source.uri.pathSegments.last.replaceFirst(
-          RegExp(r'\.[^.]+$'),
-          '',
-        );
+      JsonMap inspected = {};
+      try {
+        final payload = await session.inspectVideo(videoPath: path);
+        inspected = (payload['video'] as Map?)?.cast<String, dynamic>() ?? payload;
+      } on Object {
+        // Optional capture-date metadata must not block importing a video.
+      }
+      final stem = defaultProjectName(
+        fileName: source.uri.pathSegments.last,
+        createdAt: DateTime.tryParse(inspected['recorded_at']?.toString() ?? ''),
+        locale: Platform.localeName,
+        existingNames: state.recentProjects
+            .map((project) => project['name']?.toString() ?? '').toList(),
+      );
         var knownRoot = state.knownProjectsRoot ?? _projectsRoot;
         final folderName = '$stem-${DateTime.now().millisecondsSinceEpoch}';
         var projectRoot = '$knownRoot/$folderName';
@@ -394,15 +443,52 @@ class ProjectNotifier extends Notifier<ProjectState> {
             );
           }
           projectCreated = true;
-          linked = await session.linkVideo(path);
           projectCreatedForRecent = true;
-        } catch (_) {
-          if (projectCreated) {
-            await session.deleteProject(projectRoot);
+          if (_disposed || generation != _projectLoadGeneration) return;
+          state = state.copyWith(knownProjectsRoot: knownRoot);
+          if (!await _rememberProjectsRoot(knownRoot) && !_disposed) {
+            _pushProjectPathNotice('无法记住项目目录', projectRoot);
           }
+          if (_disposed || generation != _projectLoadGeneration) return;
+          linked = await session.linkVideo(path);
+        } catch (error) {
+          final uncertain =
+              error is EngineException &&
+              const {
+                'ENGINE_TIMEOUT',
+                'ENGINE_EXITED',
+                'ENGINE_NOT_RUNNING',
+                'ENGINE_WRITE_FAILED',
+                'ENGINE_DISPOSED',
+              }.contains(error.code);
+          if (_disposed || generation != _projectLoadGeneration) return;
           session.restore(checkpoint);
+          if (projectCreated || uncertain) {
+            projectCreatedForRecent = true;
+            state = state.copyWith(knownProjectsRoot: knownRoot);
+            if (!await _rememberProjectsRoot(knownRoot) && !_disposed) {
+              _pushProjectPathNotice('无法记住项目目录', projectRoot);
+            }
+          }
+          if (_disposed || generation != _projectLoadGeneration) return;
+          if (uncertain) {
+            _pushProjectPathNotice(
+              projectCreated ? '导入未确认，项目已保留' : '项目可能已创建',
+              projectRoot,
+              uncertain: !projectCreated,
+            );
+            throw SessionStateException(
+              projectCreated
+                  ? '导入未确认，项目已保留；稍后打开检查，请勿重复导入'
+                  : '项目可能已创建；稍后打开检查，请勿重复导入',
+            );
+          }
+          if (projectCreated) {
+            _pushProjectPathNotice('导入失败，项目已保留', projectRoot);
+          }
           rethrow;
         }
+        if (_disposed || generation != _projectLoadGeneration) return;
         final linkedVideo = (linked['video'] as Map?)?.cast<String, dynamic>();
         state = state.copyWith(
           knownProjectsRoot: knownRoot,
@@ -421,13 +507,13 @@ class ProjectNotifier extends Notifier<ProjectState> {
           video: linkedVideo,
           job: null,
           exportJob: null,
+          exportStartUnconfirmed: false,
           statistics: null,
           candidates: const <JsonMap>[],
           players: const <JsonMap>[],
           exportHistory: const <JsonMap>[],
           workflowDraft: null,
         );
-        await _rememberProjectsRoot(knownRoot);
         ref.read(sidebarExtendedProvider.notifier).collapseForProjectCreation();
         state = state.copyWith(busyMessage: '正在生成视频预览…');
         final duration = (linkedVideo?['duration_ms'] as num?)?.toInt() ?? 1001;
@@ -445,6 +531,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
         }
         if (_disposed || generation != _projectLoadGeneration) return;
         state = state.copyWith(busyMessage: '正在识别篮筐区域…');
+        final roiWatch = Stopwatch()..start();
+        appLog('info', 'import', '自动识别篮筐 开始');
         Rect? suggestedRoi;
         Rect? hoopBbox;
         String? roiSource;
@@ -510,11 +598,22 @@ class ProjectNotifier extends Notifier<ProjectState> {
           queuePaused: false,
           exportQueued: false,
         );
+        appLog(
+          roiSuggestionError == null ? 'info' : 'warn',
+          'import',
+          '自动识别篮筐 结果=${suggestedRoi == null ? '未识别' : '成功'} '
+              '来源=${roiSource ?? 'manual'} '
+              '置信度=${roiConfidence == null ? '-' : roiConfidence.toStringAsFixed(3)} '
+              '用时=${roiWatch.elapsedMilliseconds}ms'
+              '${roiSuggestionError == null ? '' : ' 错误=$roiSuggestionError'}',
+        );
         _reviewHistory.clear();
         await refreshVideos();
+        if (!_disposed && generation == _projectLoadGeneration) {
+          _pushNotice('视频已加载，已优先尝试自动识别篮筐区域', NoticeSeverity.success);
+        }
       },
       busyMessage: '正在准备视频…',
-      successMessage: '视频已加载，已优先尝试自动识别篮筐区域',
     );
     if (projectCreatedForRecent && !_disposed) {
       await loadRecentProjects();
@@ -695,9 +794,9 @@ class ProjectNotifier extends Notifier<ProjectState> {
   Future<bool> relinkCurrentVideo(String path) async {
     final video = state.video;
     if (video == null) return false;
-    final generation = ++_projectLoadGeneration;
     var relinked = false;
     await _runBusy(() async {
+      final generation = ++_projectLoadGeneration;
       await ref.read(engineBootstrapProvider.notifier).ensure();
       final session = ref.read(projectSessionProvider);
       final result = await session.relinkVideo(path);
@@ -750,6 +849,18 @@ class ProjectNotifier extends Notifier<ProjectState> {
     final session = ref.read(projectSessionProvider);
     final normalizedRoot = canonicalProjectPath(root);
     final wasCurrentProject = session.projectRoot == normalizedRoot;
+    final deletedId = state.recentProjects
+        .map((project) => project['project_root']?.toString() ?? '')
+        .where((path) => canonicalProjectPath(path) == normalizedRoot)
+        .map((path) => state.recentProjects
+            .firstWhere(
+              (project) =>
+                  canonicalProjectPath(project['project_root']?.toString() ?? '') ==
+                  normalizedRoot,
+            )['id']
+            ?.toString())
+        .firstOrNull;
+    appLog('info', 'project', '删除项目 id=${deletedId ?? '(未知)'} 当前项目=$wasCurrentProject');
     if (wasCurrentProject) await flushReviewQueue();
     await _runBusy(() async {
       await session.deleteProject(root);
@@ -793,14 +904,66 @@ class ProjectNotifier extends Notifier<ProjectState> {
     await _reviewQueue;
   }
 
+  /// L194：带返回 id 的提示（用于延迟显示/主动撤销场景）。
+  String _pushNoticeWithId(
+    String title,
+    NoticeSeverity severity, {
+    Duration duration = const Duration(seconds: 4),
+  }) {
+    final id =
+        'project-${DateTime.now().microsecondsSinceEpoch}-${_noticeCounter++}';
+    if (_disposed) return id;
+    appLog(
+      switch (severity) {
+        NoticeSeverity.error => 'error',
+        NoticeSeverity.warning => 'warn',
+        _ => 'info',
+      },
+      'notice',
+      title,
+    );
+    ref.read(noticeProvider.notifier).push(
+      NoticeMessage(id: id, severity: severity, title: title, duration: duration),
+    );
+    return id;
+  }
+
+  void _dismissNotice(String id) {
+    if (_disposed) return;
+    ref.read(noticeProvider.notifier).dismiss(id);
+  }
+
   Future<bool> closeProjectSafely() async {
     if (_closingProject || _disposed) return false;
     _closingProject = true;
     final generation = _projectLoadGeneration;
-    _pushNotice('正在保存修改并关闭项目…', NoticeSeverity.info);
+    // L194：关闭慢于 600ms 才显示提示，结束即撤销；快路径用户无感。
+    String? pendingNoticeId;
+    Timer? noticeTimer;
+    void scheduleNotice() {
+      noticeTimer = Timer(const Duration(milliseconds: 600), () {
+        pendingNoticeId = _pushNoticeWithId(
+          '正在保存修改并关闭项目…',
+          NoticeSeverity.info,
+          duration: const Duration(days: 1),
+        );
+      });
+    }
+
+    scheduleNotice();
+    void dismissPending() {
+      noticeTimer?.cancel();
+      if (pendingNoticeId != null) _dismissNotice(pendingNoticeId!);
+      pendingNoticeId = null;
+    }
+
     try {
-      await _busyOperation.timeout(const Duration(seconds: 30));
-      await flushReviewQueue().timeout(const Duration(seconds: 30));
+      try {
+        await _busyOperation.timeout(const Duration(seconds: 30));
+        await flushReviewQueue().timeout(const Duration(seconds: 30));
+      } finally {
+        dismissPending();
+      }
       if (_disposed || generation != _projectLoadGeneration) return false;
       if (state.busy) {
         _pushNotice('请先等待当前操作结束或取消正在运行的任务', NoticeSeverity.info);
@@ -812,6 +975,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
       if (!_disposed) _pushNotice('关闭项目失败：$error', NoticeSeverity.error);
       return false;
     } finally {
+      dismissPending();
       _closingProject = false;
     }
   }
@@ -922,19 +1086,17 @@ class ProjectNotifier extends Notifier<ProjectState> {
     String? videoTypeLabel,
   }) async {
     var opened = false;
+    appLog('info', 'project', '打开项目');
+    // 会话身份一变，排在导入页队列里的草稿就成了过期写入；先等它写完（超时 2 秒放行）。
+    await flushDraftBeforeShutdown();
     await flushReviewQueue();
     await _runBusy(() async {
       final generation = ++_projectLoadGeneration;
+      await _loadUncertainExportStarts();
       await ref.read(engineBootstrapProvider.notifier).ensure();
       final session = ref.read(projectSessionProvider);
-      final checkpoint = session.checkpoint();
-      late final JsonMap payload;
-      try {
-        payload = await session.openProject(root);
-      } catch (_) {
-        session.restore(checkpoint);
-        rethrow;
-      }
+      // openProject 失败时不会修改会话，无需恢复旧快照。
+      final payload = await session.openProject(root);
       if (generation != _projectLoadGeneration) return;
       var video = (payload['video'] as Map?)?.cast<String, dynamic>();
       var sourceMissing = false;
@@ -984,6 +1146,21 @@ class ProjectNotifier extends Notifier<ProjectState> {
           : _normalizeRoi(storedNetRoi.cast<String, dynamic>(), video);
       final restoredRoiSource = calibration?['source']?.toString() ?? 'manual';
       _applyVideoContext(payload);
+      final openedVideos = ((payload['videos'] as List?) ?? const <dynamic>[])
+          .whereType<Map>()
+          .toList();
+      final missingSegments = <int>[
+        for (final (index, item) in openedVideos.indexed)
+          if (_segmentSourceMissing(item)) index + 1,
+      ];
+      // 单段项目缺源视频已有专门的重新定位流程，这里只管多段项目的各段。
+      if (openedVideos.length > 1 && missingSegments.isNotEmpty) {
+        _pushNotice(
+          '第 ${missingSegments.join('、')} 段的原视频找不到，请在导入页重新定位',
+          NoticeSeverity.warning,
+        );
+      }
+      if (((payload['orientation_corrected'] as List?) ?? const []).isNotEmpty) {
       if (((payload['orientation_corrected'] as List?) ?? const [])
           .isNotEmpty) {
         ref
@@ -1012,6 +1189,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
         roiSuggestionError: null,
         job: null,
         exportJob: null,
+        exportStartUnconfirmed: _uncertainExportStarts.containsKey(_exportProjectKey()),
         candidates: const <JsonMap>[],
         exportHistory: const <JsonMap>[],
         hydrating: video != null && session.videoId != null,
@@ -1069,7 +1247,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
               : 'standard',
         );
       }
-    } catch (_) {
+    } catch (error) {
+      appLog('warn', 'project_state', '_hydrateOpenedProject 忽略了错误: $error');
       // 旧项目没有模式记录时保持 standard。
     }
     try {
@@ -1131,6 +1310,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
               ? state.job
               : analysisJob ?? latestAnalysisJob,
           exportJob: activeExportJob ?? latestExportJob,
+          exportStartUnconfirmed: _resolveUncertainExport(_exportProjectKey(), activeExportJob ?? latestExportJob)
+              ? false : state.exportStartUnconfirmed,
           analysisMode:
               _jobAnalysisMode(analysisJob ?? latestAnalysisJob) ??
               state.analysisMode,
@@ -1192,7 +1373,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
           projects = await ref
               .read(projectSessionProvider)
               .loadRecentProjects(knownRoot: root);
-        } catch (_) {
+        } catch (error) {
+          appLog('warn', 'project_state', 'loadRecentProjects 忽略了错误: $error');
           continue;
         }
         for (final project in projects) {
@@ -1204,14 +1386,19 @@ class ProjectNotifier extends Notifier<ProjectState> {
       state = state.copyWith(
         recentProjects: projectsByPath.values.take(20).toList(),
       );
+      appLog('info', 'home', '最近项目加载结束 共=${state.recentProjects.length}');
     } catch (error) {
       state = state.copyWith(recentError: error.toString());
+      appLog('warn', 'home', '最近项目加载失败: $error');
     } finally {
       state = state.copyWith(recentLoading: false);
     }
   }
 
-  /// 等价 app.dart:_saveRoi(404)。
+  static bool _segmentSourceMissing(Map item) {
+    return item['source_exists'] == false;
+  }
+
   void _applyVideoContext(JsonMap payload) {
     final queue = (payload['analysis_queue'] as Map?)?.cast<String, dynamic>();
     state = state.copyWith(
@@ -1242,6 +1429,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
   /// 切换当前操作的视频段：导入页设置它的篮筐，审核页播放它的原视频。
   void activateVideo(String videoId) {
     if (state.video?['id']?.toString() == videoId) return;
+    appLog('info', 'video', '切换视频 id=$videoId');
     final summary = state.videos.cast<JsonMap?>().firstWhere(
       (video) => video?['id']?.toString() == videoId,
       orElse: () => null,
@@ -1307,7 +1495,15 @@ class ProjectNotifier extends Notifier<ProjectState> {
     final ordered = [
       for (final video in inspected) video['source_path'].toString(),
     ];
+    final ordered = [for (final video in inspected) video['source_path'].toString()];
+    final previousVideo = state.video;
+    final previousGeneration = _projectLoadGeneration;
     await selectVideo(ordered.first);
+    if (_projectLoadGeneration != previousGeneration + 1 ||
+        identical(state.video, previousVideo) ||
+        state.video?['source_path']?.toString() != ordered.first) {
+      return;
+    }
     final first = state.videos.firstOrNull;
     if (first == null) return;
     await _runBusy(() async {
@@ -1383,7 +1579,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
         maxSamples: 12,
         confidence: 0.05,
       );
-    } catch (_) {
+    } catch (error) {
+      appLog('warn', 'project_state', '_calibrateAddedVideo 忽略了错误: $error');
       // 自动识别失败的段留给用户手动框选。
       return;
     }
@@ -1470,14 +1667,31 @@ class ProjectNotifier extends Notifier<ProjectState> {
     required double beforeSeconds,
     required double afterSeconds,
   }) async {
-    final videoIds = [
-      for (final video in state.videos)
-        if (!needsHoopConfirmation(video) &&
-            (video['analysis_job'] as Map?)?['state'] != 'completed')
-          video['id'].toString(),
-    ];
+    appLog('info', 'analysis', '开始排队分析多段视频 before=${beforeSeconds}s after=${afterSeconds}s');
+    _queueOutcomes.clear();
+    final missingSegments = <int>[];
+    final videoIds = <String>[];
+    for (final (index, video) in state.videos.indexed) {
+      if (needsHoopConfirmation(video) ||
+          (video['analysis_job'] as Map?)?['state'] == 'completed') {
+        continue;
+      }
+      if (_segmentSourceMissing(video)) {
+        missingSegments.add(index + 1);
+        continue;
+      }
+      videoIds.add(video['id'].toString());
+    }
+    if (missingSegments.isNotEmpty) {
+      _pushNotice(
+        '第 ${missingSegments.join('、')} 段的原视频找不到，已跳过；请在导入页重新定位后再分析',
+        NoticeSeverity.warning,
+      );
+    }
     if (videoIds.isEmpty) {
-      _pushNotice('没有需要分析的视频段', NoticeSeverity.info);
+      if (missingSegments.isEmpty) {
+        _pushNotice('没有需要分析的视频段', NoticeSeverity.info);
+      }
       return;
     }
     await _saveAnalysisQueue(
@@ -1490,10 +1704,12 @@ class ProjectNotifier extends Notifier<ProjectState> {
   }
 
   Future<void> pauseAnalysisQueue() async {
+    appLog('info', 'analysis', '队列 暂停 剩余=${state.analysisQueue.length}');
     state = state.copyWith(queuePaused: true);
   }
 
   Future<void> resumeAnalysisQueue() async {
+    appLog('info', 'analysis', '队列 继续 剩余=${state.analysisQueue.length}');
     state = state.copyWith(queuePaused: false);
     await _startNextQueued();
   }
@@ -1502,6 +1718,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
   Future<void> removeFromAnalysisQueue(String videoId) async {
     if (state.analysisRunning && state.analysisQueue.firstOrNull == videoId)
       return;
+    if (state.analysisRunning && state.analysisQueue.firstOrNull == videoId) return;
+    appLog('info', 'analysis', '队列 移除 id=$videoId 剩余=${state.analysisQueue.length - 1}');
     await _saveAnalysisQueue([
       for (final id in state.analysisQueue)
         if (id != videoId) id,
@@ -1575,6 +1793,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
   Future<void> _advanceAnalysisQueue(JsonMap? job) async {
     final videoId = job?['video_id']?.toString();
     if (videoId == null || state.analysisQueue.firstOrNull != videoId) return;
+    _queueOutcomes[videoId] = job?['state']?.toString() ?? '';
     if (job?['state'] == 'cancelled') {
       state = state.copyWith(queuePaused: true);
     } else {
@@ -1589,7 +1808,19 @@ class ProjectNotifier extends Notifier<ProjectState> {
       return;
     }
     if (state.analysisQueue.isEmpty) {
-      _pushNotice('全部视频段分析完成', NoticeSeverity.success);
+      final allCompleted =
+          _queueOutcomes.isNotEmpty &&
+          _queueOutcomes.values.every((outcome) => outcome == 'completed');
+      _queueOutcomes.clear();
+      if (allCompleted) {
+        _pushNotice('全部视频段分析完成', NoticeSeverity.success);
+      } else {
+        _pushNotice('分析队列已结束，有视频段没有分析成功，请在列表里查看', NoticeSeverity.warning);
+      }
+      state = state.copyWith(
+        queueFinishedCount: state.queueFinishedCount + 1,
+        lastQueueAllCompleted: allCompleted,
+      );
     }
     await _startNextQueued();
   }
@@ -1676,6 +1907,13 @@ class ProjectNotifier extends Notifier<ProjectState> {
     final requestedMode = mode == 'fast' || mode == 'standard'
         ? mode
         : state.analysisMode;
+    appLog(
+      'info',
+      'analysis',
+      '开始分析 mode=$requestedMode before=${beforeSeconds}s after=${afterSeconds}s '
+          'video=${state.video?['width']}x${state.video?['height']} '
+          'fps=${state.video?['fps']} duration_ms=${state.video?['duration_ms']}',
+    );
     await _runBusy(() async {
       await flushReviewQueue();
       await ref.read(engineBootstrapProvider.notifier).ensure();
@@ -1789,7 +2027,23 @@ class ProjectNotifier extends Notifier<ProjectState> {
           unawaited(_advanceAnalysisQueue(nextJob));
         }
         if (nextState != previousState) {
+          appLog(
+            nextState == 'failed' ? 'error' : 'info',
+            'analysis',
+            '分析任务状态 $previousState → $nextState job=$jobId '
+                'stage=${nextJob?['stage']} code=${nextJob?['error_code']} '
+                'msg=${nextJob?['error_message']}',
+          );
           final segment = state.segmentOf(nextJob?['video_id']?.toString());
+          if (nextState == 'completed') {
+            // 界面侧汇总：引擎已经记了内部阶段耗时，这里只补用户看到的候选数与模式。
+            appLog(
+              'info',
+              'analysis',
+              '分析完成 候选=${state.candidates.length} 模式=${state.analysisMode} '
+                  'job=$jobId segment=${segment ?? '-'}',
+            );
+          }
           if (nextState == 'completed' && segment != null) {
             _pushNotice('第 $segment 段分析完成', NoticeSeverity.success);
           } else if (nextState == 'completed') {
@@ -1836,7 +2090,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
             requestScope,
             preferredJobId: jobId,
           );
-        } catch (_) {}
+        } catch (error) { appLog('warn', 'project_state', 'pollJob 忽略了错误: $error'); }
       }
       if (!resumedAfterTransportError) {
         _markEngineJobRecoverable(error, export: false);
@@ -1869,6 +2123,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
 
   /// 等价 app.dart:_retryAnalysis(521)。
   Future<void> retryAnalysis({String? mode}) async {
+    appLog('info', 'analysis', '重试分析 mode=$mode');
     final jobId = state.job?['id'];
     if (jobId is! String) return;
     final requestedMode = mode == 'fast' || mode == 'standard'
@@ -1921,6 +2176,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
 
   /// 等价 app.dart:_cancelAnalysis(538)。
   Future<void> cancelAnalysis() async {
+    appLog('info', 'analysis', '请求取消分析 job=${state.job?['id']}');
     final jobId = state.job?['id'];
     if (jobId is! String) return;
     final generation = _projectLoadGeneration;
@@ -2022,7 +2278,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
             ? Map<String, dynamic>.from(raw)
             : const <String, dynamic>{},
       );
-    } catch (_) {
+    } catch (error) {
+      appLog('warn', 'project_state', 'refreshStatistics 忽略了错误: $error');
       // 统计是辅助展示，旧版 Engine 不支持时不阻塞审核流程。
     }
   }
@@ -2035,7 +2292,10 @@ class ProjectNotifier extends Notifier<ProjectState> {
   Future<bool> renameProject(String name, {String? projectRoot}) async {
     if (_disposed) return false;
     final trimmed = name.trim();
-    if (trimmed.isEmpty || trimmed.length > projectNameMaxLength) return false;
+    if (trimmed.isEmpty || trimmed.length > projectNameMaxLength) {
+      appLog('warn', 'home', '重命名项目被拒 名字为空或超长');
+      return false;
+    }
     final target = projectRoot?.trim() ?? '';
     final isCurrent =
         target.isEmpty ||
@@ -2056,6 +2316,12 @@ class ProjectNotifier extends Notifier<ProjectState> {
       if (_disposed) return false;
       if (!isCurrent) {
         // 改的不是当前项目：同步最近项目列表里的名字，不必重开项目。
+        String? renamedId;
+        for (final item in state.recentProjects) {
+          if (item['project_root']?.toString() == target) {
+            renamedId = (item['project'] as Map?)?['id']?.toString();
+          }
+        }
         state = state.copyWith(
           recentProjects: [
             for (final item in state.recentProjects)
@@ -2070,6 +2336,11 @@ class ProjectNotifier extends Notifier<ProjectState> {
               else
                 item,
           ],
+        );
+        appLog(
+          'info',
+          'home',
+          '重命名项目结束 ok=true 范围=其他项目 id=${renamedId ?? '(未知)'}',
         );
         return true;
       }
@@ -2087,8 +2358,15 @@ class ProjectNotifier extends Notifier<ProjectState> {
         );
       }
       unawaited(refreshStatistics());
+      appLog(
+        'info',
+        'home',
+        '重命名项目结束 ok=true 范围=当前项目 '
+            'id=${ref.read(projectSessionProvider).projectId ?? '(未知)'}',
+      );
       return true;
     } catch (error) {
+      appLog('warn', 'home', '重命名项目失败: $error');
       if (!_disposed) _pushNotice('项目名称保存失败：$error', NoticeSeverity.error);
       return false;
     }
@@ -2099,6 +2377,11 @@ class ProjectNotifier extends Notifier<ProjectState> {
     try {
       await ref.read(projectSessionProvider).startReview(id);
     } catch (error) {
+      // 只是记录审核耗时，忙到重试用完也不该打断用户：只写日志，不弹通知。
+      if (error is EngineException && error.code == 'PROJECT_BUSY') {
+        appLog('warn', 'review', '开始记录审核耗时被跳过（项目忙）: $error');
+        return;
+      }
       _pushNotice('开始记录审核耗时失败：$error', NoticeSeverity.error);
     }
   }
@@ -2111,6 +2394,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
     bool showNotice = true,
   }) {
     if (_disposed) return Future<bool>.value(false);
+    appLog('info', 'review', '标记候选 id=$id → $status${reason == null ? '' : ' reason=$reason'}');
     final generation = _projectLoadGeneration;
     final engineStatus = status == 'included' ? 'goal' : status;
     final pending = _pendingReviews[id];
@@ -2289,6 +2573,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
 
   /// 等价 app.dart:_undoReview(599)。
   Future<void> undoReview() {
+    appLog('info', 'review', '撤销上一步审核');
     final pending = _undoOperation;
     if (pending != null) return pending;
     final generation = _projectLoadGeneration;
@@ -2325,6 +2610,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
 
   /// 等价 app.dart:_updateClipRange(612)。
   Future<void> updateClipRange(String id, int startMs, int endMs) async {
+    appLog('info', 'review', '调整范围 id=$id start=${startMs}ms end=${endMs}ms');
     await _runBusy(() async {
       await ref
           .read(projectSessionProvider)
@@ -2365,6 +2651,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
     int? eventTimeMs,
   }) async {
     JsonMap? created;
+    appLog('info', 'review', '补漏候选 start=${startMs}ms end=${endMs}ms event=${eventTimeMs}ms');
     await _runBusy(() async {
       final payload = await ref
           .read(projectSessionProvider)
@@ -2456,6 +2743,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
   }
 
   Future<void> setCandidatePlayer(String candidateId, String? playerId) async {
+    appLog('info', 'review', '设置球员标签 id=$candidateId player=${playerId ?? '(清除)'}');
     await _runPlayerChange((generation) async {
       await ref
           .read(projectSessionProvider)
@@ -2472,7 +2760,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
   }) {
     if (_disposed) return Future<void>.value();
     if (_closingProject) {
-      _pushNotice('正在保存修改并关闭项目…', NoticeSeverity.info);
+      // L194：关闭期间不再推同文案提示（closeProjectSafely 自己管理延迟提示）。
       return Future<void>.value();
     }
     final generation = _projectLoadGeneration;
@@ -2520,6 +2808,136 @@ class ProjectNotifier extends Notifier<ProjectState> {
 
   /// 等价 app.dart:_export(623)。
   Future<void> Function()? _queuedExport;
+  final Map<String, ({DateTime startedAt, String? previousId})> _uncertainExportStarts = {};
+  static const _uncertainExportPrefsKey = 'bhe.desktop.uncertain_export_starts';
+  Future<void>? _uncertainLoad;
+  Future<void> _uncertainWrites = Future.value();
+
+  bool _uncertainLoadWarned = false;
+
+  Future<void> _loadUncertainExportStarts() {
+    final existing = _uncertainLoad;
+    if (existing != null) return existing;
+    final completer = Completer<void>();
+    _uncertainLoad = completer.future;
+    () async {
+      var failed = false;
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final raw = prefs.getString(_uncertainExportPrefsKey);
+        if (raw != null) {
+          final decoded = jsonDecode(raw);
+          if (decoded is! Map) throw const FormatException('Invalid export state');
+          for (final entry in decoded.entries) {
+            if (entry.key is! String || entry.value is! Map) {
+              failed = true;
+              continue;
+            }
+            final record = entry.value as Map;
+            final rawStarted = record['startedAt'];
+            final previousId = record['previousId'];
+            final started = rawStarted is String ? DateTime.tryParse(rawStarted) : null;
+            if (started == null || !record.containsKey('previousId') ||
+                (previousId != null && previousId is! String)) {
+              failed = true;
+              continue;
+            }
+            _uncertainExportStarts.putIfAbsent(entry.key as String, () => (
+              startedAt: started.toUtc(), previousId: previousId as String?,
+            ));
+          }
+        }
+      } catch (error) {
+        appLog('warn', 'project_state', '_loadUncertainExportStarts 忽略了错误: $error');
+        failed = true;
+      }
+      if (failed) {
+        // 无法读取时按无标记处理，无法保证防止重复导出；联调时需验证。
+        _uncertainLoad = null;
+        if (!_uncertainLoadWarned && !_disposed) {
+          _uncertainLoadWarned = true;
+          _pushNotice('导出任务保护状态读取失败，已忽略', NoticeSeverity.warning);
+        }
+      }
+      completer.complete();
+    }();
+    return completer.future;
+  }
+
+  Future<void> _saveUncertainExportStarts() {
+    final write = _uncertainWrites.then((_) async {
+      final prefs = await SharedPreferences.getInstance();
+      final encoded = jsonEncode({for (final entry in _uncertainExportStarts.entries)
+        entry.key: {'startedAt': entry.value.startedAt.toIso8601String(), 'previousId': entry.value.previousId}});
+      if (!await prefs.setString(_uncertainExportPrefsKey, encoded)) throw StateError('Could not save export state');
+    });
+    _uncertainWrites = write.catchError((_) {});
+    return write;
+  }
+
+  void _persistResolvedExportStart() {
+    unawaited(_saveUncertainExportStarts().catchError((_) {
+      if (!_disposed) _pushNotice('导出任务状态无法保存，请下次打开项目时重新检查。', NoticeSeverity.warning);
+    }));
+  }
+
+  String _exportProjectKey() {
+    final session = ref.read(projectSessionProvider);
+    final root = session.projectRoot;
+    return root == null ? '__unknown_project__' : '${canonicalProjectPath(root)}\u0000${session.projectId ?? ''}';
+  }
+
+  bool _resolveUncertainExport(String key, JsonMap? job) {
+    final pending = _uncertainExportStarts[key];
+    if (pending == null || job == null || job['id'] == null || job['id'] == pending.previousId) return false;
+    final created = DateTime.tryParse(job['created_at']?.toString() ?? '');
+    if (created == null || created.toUtc().isBefore(pending.startedAt.subtract(const Duration(milliseconds: 1)))) return false;
+    _uncertainExportStarts.remove(key);
+    _persistResolvedExportStart();
+    return true;
+  }
+
+  Future<void> checkUnconfirmedExport() async {
+    if (_disposed || !state.exportStartUnconfirmed || state.busy) return;
+    final key = _exportProjectKey();
+    final generation = _projectLoadGeneration;
+    state = state.copyWith(busy: true);
+    try {
+      await ref.read(engineBootstrapProvider.notifier).ensure();
+      final scope = ref.read(projectSessionProvider).snapshot();
+      final active = await scope.getActiveJobs(jobType: 'export');
+      final latest = await scope.getLatestJob(jobType: 'export');
+      if (_disposed || generation != _projectLoadGeneration || key != _exportProjectKey()) return;
+      final found = active.isNotEmpty ? active.last : latest;
+      if (_resolveUncertainExport(key, found)) {
+        state = state.copyWith(exportStartUnconfirmed: false, exportJob: found);
+        if (found?['recovery_state'] == 'worker_attached' && found?['id'] is String) {
+          unawaited(pollExportJob(found!['id'] as String, scope: scope));
+        }
+      } else {
+        _pushNotice('未找到可确认的导出任务，请检查后再决定是否允许重新导出。', NoticeSeverity.warning);
+      }
+    } catch (error) {
+      if (!_disposed && generation == _projectLoadGeneration) _pushNotice('任务状态加载失败：$error', NoticeSeverity.error);
+    } finally {
+      if (!_disposed && generation == _projectLoadGeneration) state = state.copyWith(busy: false);
+    }
+  }
+
+  void confirmUncertainExportChecked() {
+    if (_disposed || state.busy || !state.exportStartUnconfirmed) return;
+    _uncertainExportStarts.remove(_exportProjectKey());
+    _persistResolvedExportStart();
+    state = state.copyWith(exportStartUnconfirmed: false);
+  }
+
+  /// 导出耗时：用任务创建时间到现在的差值，取不到就算 0（只为日志可读性）。
+  int _exportElapsedMs(String jobId) {
+    final createdAt = state.exportJob?['created_at']?.toString();
+    final started = createdAt == null ? null : DateTime.tryParse(createdAt);
+    if (started == null) return 0;
+    return DateTime.now().toUtc().difference(started.toUtc()).inMilliseconds;
+  }
 
   Future<void> export(
     String mode, {
@@ -2530,6 +2948,10 @@ class ProjectNotifier extends Notifier<ProjectState> {
     bool? includeUnassigned,
     String effect = 'none',
   }) async {
+    if (state.exportStartUnconfirmed) {
+      _pushNotice('上一次导出启动结果未确认，请先查看导出任务', NoticeSeverity.warning);
+      return;
+    }
     if (state.busy || _isActiveJob(state.exportJob)) return;
     if (state.analysisRunning && state.analysisQueue.isNotEmpty) {
       _queuedExport = () => export(
@@ -2545,9 +2967,53 @@ class ProjectNotifier extends Notifier<ProjectState> {
       _pushNotice('导出会在当前这段分析完成后开始，之后继续排队', NoticeSeverity.info);
       return;
     }
+    final generation = _projectLoadGeneration;
+    final scope = _captureScope();
+    final projectKey = _exportProjectKey();
+    final startedAt = DateTime.now().toUtc();
+    final previousId = state.exportJob?['id']?.toString();
+    var guardSaved = false;
+    var requestSent = false;
     state = state.copyWith(busy: true);
+    final kept = state.candidates
+        .where((item) => item['selection_status'] != 'excluded')
+        .where(
+          (item) =>
+              playerIds == null || playerIds.contains(item['player_id']?.toString()),
+        )
+        .length;
+    appLog(
+      'info',
+      'export',
+      '开始导出 mode=$mode effect=$effect 候选=${state.candidates.length} '
+          '按球员过滤后=$kept 球员过滤=${playerIds == null ? '无' : '有'} '
+          '含未分配=${includeUnassigned ?? false}',
+    );
     try {
+      await _loadUncertainExportStarts();
+      if (_disposed || generation != _projectLoadGeneration) return;
+      if (_uncertainExportStarts.containsKey(projectKey)) {
+        state = state.copyWith(busy: false, exportStartUnconfirmed: true);
+        _pushNotice('上一次导出启动结果未确认，请先查看导出任务', NoticeSeverity.warning);
+        return;
+      }
       await flushReviewQueue();
+      if (_disposed || generation != _projectLoadGeneration) return;
+      _uncertainExportStarts[projectKey] = (startedAt: startedAt, previousId: previousId);
+      try {
+        await _saveUncertainExportStarts();
+        guardSaved = true;
+      } catch (error) {
+        appLog('warn', 'project_state', 'export 忽略了错误: $error');
+        _uncertainExportStarts.remove(projectKey);
+        throw const SessionStateException('无法保存导出任务状态，未开始导出。');
+      }
+      if (_disposed || generation != _projectLoadGeneration) {
+        _uncertainExportStarts.remove(projectKey);
+        _persistResolvedExportStart();
+        return;
+      }
+      requestSent = true;
       final result = await ref
           .read(projectSessionProvider)
           .startExport(
@@ -2559,19 +3025,39 @@ class ProjectNotifier extends Notifier<ProjectState> {
             includeUnassigned: includeUnassigned,
             effect: effect,
           );
-      if (_disposed) return;
+      if (_disposed || generation != _projectLoadGeneration) return;
       final job = (result['job'] as Map?)?.cast<String, dynamic>();
       state = state.copyWith(exportJob: job);
       final jobId = job?['id'];
       if (jobId is! String) {
         throw const SessionStateException('导出任务未返回 id');
       }
+      _uncertainExportStarts.remove(projectKey);
+      _persistResolvedExportStart();
       // 只锁定“启动导出”这一小段时间；实际编码在后台轮询，审核仍可继续。
       state = state.copyWith(busy: false);
-      unawaited(pollExportJob(jobId));
+      unawaited(pollExportJob(jobId, scope: scope));
     } catch (error) {
-      if (_disposed) return;
-      _pushNotice(error.toString(), NoticeSeverity.error);
+      appLog('error', 'export', '导出启动失败: $error');
+      if (_disposed || generation != _projectLoadGeneration) return;
+      if ((error is EngineException && const {'ENGINE_TIMEOUT', 'ENGINE_EXITED', 'ENGINE_NOT_RUNNING', 'ENGINE_WRITE_FAILED', 'ENGINE_DISPOSED'}.contains(error.code)) ||
+          (requestSent && error is SessionStateException && error.message == '导出任务未返回 id')) {
+        _uncertainExportStarts[projectKey] = (startedAt: startedAt, previousId: previousId);
+        state = state.copyWith(exportStartUnconfirmed: true);
+        try {
+          await _saveUncertainExportStarts();
+        } catch (error) {
+          appLog('warn', 'project_state', 'export 忽略了错误: $error');
+          _pushNotice('导出任务状态无法保存，请下次打开项目时重新检查。', NoticeSeverity.warning);
+        }
+        _pushNotice('上一次导出启动结果未确认，请先查看导出任务', NoticeSeverity.warning);
+      } else {
+        if (guardSaved) {
+          _uncertainExportStarts.remove(projectKey);
+          _persistResolvedExportStart();
+        }
+        _pushNotice(error.toString(), NoticeSeverity.error);
+      }
       state = state.copyWith(busy: false);
     }
   }
@@ -2603,6 +3089,17 @@ class ProjectNotifier extends Notifier<ProjectState> {
         scope: requestScope,
       );
       final jobState = state.exportJob?['state']?.toString();
+      final exportedFiles = (state.exportJob?['result_files'] as List?)?.length ??
+          (state.exportJob?['files'] as List?)?.length;
+      final exportedDurationMs = (state.exportJob?['duration_ms'] as num?)?.toInt() ??
+          (state.exportJob?['result_duration_ms'] as num?)?.toInt();
+      appLog(
+        jobState == 'failed' ? 'error' : 'info',
+        'export',
+        '导出结束 state=$jobState job=$jobId 文件数=${exportedFiles ?? '-'} '
+            '总时长=${exportedDurationMs == null ? '-' : '${exportedDurationMs}ms'} '
+            '耗时=${_exportElapsedMs(jobId)}ms',
+      );
       unawaited(_startNextQueued());
       if (jobState == 'completed') {
         _pushNotice('导出完成', NoticeSeverity.success);
@@ -2615,6 +3112,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
         );
       }
     } catch (error) {
+      appLog('error', 'export', '导出轮询出错 job=$jobId: $error');
       if (_disposed || projectGeneration != _projectLoadGeneration) return;
       _markEngineJobRecoverable(error, export: true);
       _pushNotice(error.toString(), NoticeSeverity.error);
@@ -2627,6 +3125,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
   Future<void> cancelExport() async {
     final jobId = state.exportJob?['id'];
     if (jobId is! String) return;
+    appLog('info', 'export', '请求取消导出 job=$jobId');
     final generation = _projectLoadGeneration;
     try {
       final result = await ref
@@ -2718,6 +3217,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
         _pushNotice(successMessage, NoticeSeverity.success);
       }
     } catch (error) {
+      appLog('error', 'project', '操作失败: $error');
       if (_disposed) return;
       _pushNotice(error.toString(), NoticeSeverity.error);
     } finally {
@@ -2730,6 +3230,16 @@ class ProjectNotifier extends Notifier<ProjectState> {
   void _pushNotice(Object error, NoticeSeverity severity) {
     final content = userFacingNotice(error);
     if (_disposed || content.title.trim().isEmpty) return;
+    // 用户看到的每条提示都留一行：反馈时对照日志就知道他当时看到了什么。
+    appLog(
+      switch (severity) {
+        NoticeSeverity.error => 'error',
+        NoticeSeverity.warning => 'warn',
+        _ => 'info',
+      },
+      'notice',
+      '${content.title}${content.description == null ? '' : ' | ${content.description}'}',
+    );
     ref
         .read(noticeProvider.notifier)
         .push(
@@ -2740,6 +3250,21 @@ class ProjectNotifier extends Notifier<ProjectState> {
             description: content.description,
           ),
         );
+  }
+
+  void _pushProjectPathNotice(String title, String path, {bool uncertain = false}) {
+    if (_disposed) return;
+    ref.read(noticeProvider.notifier).push(NoticeMessage(
+      id: 'project-path-${DateTime.now().microsecondsSinceEpoch}-${_noticeCounter++}',
+      severity: NoticeSeverity.warning,
+      title: title,
+      description: uncertain
+          ? '项目可能保存在：$path，可在首页「打开项目」选择该文件夹。'
+          : '项目保存在：$path，可在首页「打开项目」选择该文件夹。',
+      actionLabel: '复制项目路径',
+      action: () => Clipboard.setData(ClipboardData(text: path)),
+      duration: const Duration(seconds: 30),
+    ));
   }
 
   /// 等价 app.dart:_projectsRoot(76)。env BHE_PROJECTS_ROOT > knownProjectsRoot >
@@ -2762,14 +3287,15 @@ class ProjectNotifier extends Notifier<ProjectState> {
       final preferences = await SharedPreferences.getInstance().timeout(
         const Duration(milliseconds: 250),
       );
-      return preferences.getStringList(_recentProjectRootsKey) ??
+      return preferences.getStringList(recentProjectRootsPrefsKey) ??
           const <String>[];
-    } catch (_) {
+    } catch (error) {
+      appLog('warn', 'project_state', '_recentProjectRoots 忽略了错误: $error');
       return const <String>[];
     }
   }
 
-  Future<void> _rememberProjectsRoot(String root) async {
+  Future<bool> _rememberProjectsRoot(String root) async {
     try {
       final canonical = canonicalProjectPath(root);
       final preferences = await SharedPreferences.getInstance().timeout(
@@ -2777,11 +3303,14 @@ class ProjectNotifier extends Notifier<ProjectState> {
       );
       final roots = <String>{
         canonical,
-        ...preferences.getStringList(_recentProjectRootsKey) ??
+        ...preferences.getStringList(recentProjectRootsPrefsKey) ??
             const <String>[],
       }.take(12).toList();
-      await preferences.setStringList(_recentProjectRootsKey, roots);
-    } catch (_) {}
+      return await preferences.setStringList(recentProjectRootsPrefsKey, roots);
+    } catch (error) {
+      appLog('warn', 'project_state', '_rememberProjectsRoot 忽略了错误: $error');
+      return false;
+    }
   }
 
   bool _isActiveJob(JsonMap? job) {

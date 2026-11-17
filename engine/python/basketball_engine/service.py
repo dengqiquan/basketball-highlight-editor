@@ -23,6 +23,8 @@ from .adapters.analysis import (
     build_pipeline_commands,
     build_rim_check_command,
     candidate_to_row,
+    dedupe_trajectory_matches,
+    trajectory_crossing,
     flatten_coarse_matches,
     flatten_refined_matches,
     focus_roi_on_net,
@@ -45,9 +47,11 @@ from .adapters.export import (
     trajectory_points,
     validate_output_file,
 )
+from .adapters.hdr import color_plan, hdr_filter_available, HDR_UNKNOWN, TONEMAP_FILTER
 from .adapters.runtime_preflight import DetectorPreflight, runtime_error
 from basketball_highlight.runtime_errors import is_runtime_failure
 from .protocol import ProtocolError
+from .request_control import fingerprint, check_cancelled, begin_commit, set_cancel_event
 from .storage import ProjectStore, new_id
 from .media_tools import resolve_media_tool
 from .diagnostics import folder_summary, log_diagnostic, video_summary
@@ -65,6 +69,7 @@ class EngineService:
         self._job_threads: dict[str, threading.Thread] = {}
         self._job_cancel_events: dict[str, threading.Event] = {}
         self._job_processes: dict[str, set[subprocess.Popen]] = {}
+        self._export_projects: dict[str, str] = {}
         self._video_merge_jobs: dict[str, Dict[str, Any]] = {}
         self._store_lock = threading.Lock()
         self._job_lock = threading.Lock()
@@ -226,6 +231,7 @@ class EngineService:
         if corrected:
             context = store.context()
             context["orientation_corrected"] = corrected
+        begin_commit()
         return context
 
     def _correct_video_orientations(self, store: ProjectStore) -> list[str]:
@@ -235,6 +241,7 @@ class EngineService:
         drawn on the wrongly oriented frame.
         """
         corrected = []
+        identity = self._project_identity(store)
         for video in store.list_videos():
             source = Path(video["source_path"])
             if not source.is_file():
@@ -244,9 +251,14 @@ class EngineService:
             except (ProtocolError, OSError):
                 continue
             # 只修正横竖互换的记录（旧版本存的是编码尺寸），其它差异不动。
-            orientation_wrong = (video.get("width"), video.get("height")) == (
-                probed["height"],
-                probed["width"],
+            # 宽高相等的视频（1:1）互换后还是一样，不能算方向错，否则每次打开项目
+            # 都会重跑 relink，指纹为空的老库还会被清掉篮筐和候选。
+            orientation_wrong = (
+                video.get("width") != video.get("height")
+                and (video.get("width"), video.get("height")) == (
+                    probed["height"],
+                    probed["width"],
+                )
             )
             # 尺寸已经对、只是没存过旋转角（加 rotation 列之前写入的项目）：
             # 只补字段，不动 ROI 和候选，否则用户已有的标注会被清掉。
@@ -262,10 +274,17 @@ class EngineService:
             )
             if not orientation_wrong and not missing_rotation:
                 continue
+            source_fingerprint = video.get("source_fingerprint")
+            if orientation_wrong and not source_fingerprint:
+                source_fingerprint = self._source_fingerprint(source)
+            self._check_project_identity(store, identity)
+            if store.video(video["id"]) != video:
+                raise ProtocolError("PROJECT_CHANGED", "视频已被修改，请重试")
+            begin_commit()
             if orientation_wrong:
                 store.relink_video(video["id"], {
                     **probed,
-                    "source_fingerprint": video.get("source_fingerprint"),
+                    "source_fingerprint": source_fingerprint,
                 })
             else:
                 store.set_video_rotation(video["id"], probed["rotation"])
@@ -473,8 +492,8 @@ class EngineService:
             "error",
             "-show_entries",
             "format=duration,size:format_tags=creation_time:"
-            "stream=index,codec_type,codec_name,width,height,r_frame_rate:"
-            "stream_side_data=rotation:stream_disposition=attached_pic:"
+            "stream=index,codec_type,codec_name,width,height,r_frame_rate,pix_fmt,color_transfer,color_primaries,color_space:"
+            "stream_side_data=side_data_type,rotation,dv_profile,dv_bl_signal_compatibility_id:stream_disposition=attached_pic:"
             "stream_tags=rotate",
             "-of",
             "json",
@@ -564,6 +583,11 @@ class EngineService:
             # 前端据此自己转画面。宽高已是显示方向，这里是逆时针的旋转角度。
             "rotation": rotation,
             "fps": fps,
+            "pix_fmt": video_stream.get("pix_fmt"),
+            "color_transfer": video_stream.get("color_transfer"),
+            "color_primaries": video_stream.get("color_primaries"),
+            "color_space": video_stream.get("color_space"),
+            "side_data_list": video_stream.get("side_data_list") or [],
             "video_codec": video_stream.get("codec_name"),
             "audio_codec": audio_stream.get("codec_name") if audio_stream else None,
             "recorded_at": (format_data.get("tags") or {}).get("creation_time"),
@@ -618,7 +642,10 @@ class EngineService:
                 },
             )
 
-    def _latest_proxy_video(self, store: ProjectStore, video_id: str) -> Path | None:
+    def _latest_proxy_video(
+        self, store: ProjectStore, video_id: str
+    ) -> tuple[Path, int, int] | None:
+        """最近一次分析留下的代理文件及其覆盖的原片时间段（毫秒）。"""
         project = store.project()
         video = store.video(video_id)
         if not project or not video:
@@ -630,29 +657,59 @@ class EngineService:
             video_id=video_id,
         )
         source_path = str(Path(video["source_path"]).resolve())
+        video_size = video.get("source_size_bytes")
+        video_mtime = video.get("source_mtime_ns")
         for job in reversed(jobs):
             checkpoint = self._decode_checkpoint(job)
             parameters = checkpoint.get("analysis_parameters")
-            if isinstance(parameters, dict) and parameters.get("source_path") not in {None, source_path}:
+            if not isinstance(parameters, dict):
+                parameters = {}
+            recorded_fingerprint = parameters.get("source_fingerprint")
+            if recorded_fingerprint:
+                # 新任务按指纹和方向核对；视频记录没有指纹时不能证明来源一致。
+                trusted = (
+                    bool(video.get("source_fingerprint"))
+                    and recorded_fingerprint == video.get("source_fingerprint")
+                    and parameters.get("source_rotation") == int(video.get("rotation") or 0)
+                )
+            else:
+                # 0.1.13 及更早的任务没存指纹：用路径 + 尺寸 + mtime 证明源没被换过
+                # （口径同 _validated_original_source 判「源未变」，当前文件与视频记录
+                # 已由 _validated_source 核对）。少了任何一项就不复用。
+                trusted = (
+                    parameters.get("source_size_bytes") is not None
+                    and parameters.get("source_mtime_ns") is not None
+                    and video_size is not None
+                    and video_mtime is not None
+                    and parameters.get("source_size_bytes") == video_size
+                    and parameters.get("source_mtime_ns") == video_mtime
+                )
+            if parameters.get("source_path") != source_path or not trusted:
                 continue
             candidate = checkpoint.get("proxy_video")
             if not isinstance(candidate, str) or not candidate:
                 continue
             path = Path(candidate).expanduser()
-            if path.is_file() and path.stat().st_size > 0:
-                return path.resolve()
+            if not path.is_file() or path.stat().st_size <= 0:
+                continue
+            try:
+                start_ms = int(parameters["analysis_start_ms"])
+                end_ms = int(parameters["analysis_end_ms"])
+                if (start_ms != int(video.get("analysis_start_ms") or 0)
+                    or end_ms != int(video.get("analysis_end_ms") or video.get("duration_ms") or 0)):
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            if end_ms > start_ms:
+                return path.resolve(), start_ms, end_ms
         return None
 
     @staticmethod
     def _source_fingerprint(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return f"{path.stat().st_size}:{digest.hexdigest()}"
+        return fingerprint(path)
 
     @classmethod
-    def _validated_original_source(cls, video: Dict[str, Any]) -> Path:
+    def _validated_original_source(cls, video: Dict[str, Any], verify_content: bool = True) -> Path:
         source = Path(video["source_path"])
         if not source.is_file():
             raise ProtocolError("VIDEO_NOT_FOUND", f"原始视频不存在: {source}")
@@ -669,7 +726,8 @@ class EngineService:
             )
         )
         content_changed = False
-        if isinstance(stored_fingerprint, str) and stored_fingerprint:
+        metadata_matches = stored_size is not None and stored_mtime is not None and not metadata_changed
+        if (verify_content or not metadata_matches) and isinstance(stored_fingerprint, str) and stored_fingerprint:
             try:
                 content_changed = stored_fingerprint != cls._source_fingerprint(source)
             except OSError:
@@ -753,6 +811,7 @@ class EngineService:
             "--device",
             str(payload.get("device") or "auto").strip().lower(),
         ]
+        check_cancelled()
         try:
             subprocess.run(
                 command,
@@ -793,6 +852,7 @@ class EngineService:
         }
         duration_ms = video.get("duration_ms")
         duration_limit = int(duration_ms) if duration_ms is not None else 1000
+        begin_commit()
         return {
             "roi": roi,
             "calibration": calibration,
@@ -824,9 +884,68 @@ class EngineService:
             return None
         return ratio if math.isfinite(ratio) and ratio > 0 else None
 
+    def _project_identity(self, store: ProjectStore) -> tuple:
+        try:
+            stat = store.db_path.stat()
+            project = store.project()
+        except (OSError, sqlite3.Error) as exc:
+            raise ProtocolError("PROJECT_NOT_FOUND", "项目已被删除或替换") from exc
+        if not project:
+            raise ProtocolError("PROJECT_INVALID", "项目尚未初始化")
+        return stat.st_dev, stat.st_ino, project["id"]
+
+    def _check_project_identity(self, store: ProjectStore, identity: tuple) -> None:
+        check_cancelled()
+        if self._project_identity(store) != identity:
+            raise ProtocolError("PROJECT_CHANGED", "项目已被删除或替换")
+
+    @staticmethod
+    def _source_identity(path: Path) -> tuple:
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            raise ProtocolError("VIDEO_SOURCE_CHANGED", "原视频不存在或读取期间发生变化") from exc
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+    @staticmethod
+    def _source_path(payload: Dict[str, Any]) -> Path:
+        raw = payload.get("video_path")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ProtocolError("INVALID_REQUEST", "缺少 video_path")
+        path = Path(raw).expanduser().absolute()
+        if not path.is_file():
+            raise ProtocolError("VIDEO_NOT_FOUND", f"视频不存在: {path}")
+        return path
+
+    def _check_source_identity(self, path: Path, identity: tuple) -> None:
+        check_cancelled()
+        if self._source_identity(path) != identity:
+            raise ProtocolError("VIDEO_SOURCE_CHANGED", "读取期间原视频发生变化，请重试")
+
     def link_video(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        metadata = self.inspect_video(payload)
         store = self._require_store(payload)
+        identity = self._project_identity(store)
+        source = self._source_path(payload)
+        source_identity = self._source_identity(source)
+        metadata = self.inspect_video(payload)
+        self._check_source_identity(source, source_identity)
+        metadata["source_fingerprint"] = self._source_fingerprint(Path(metadata["source_path"]))
+        self._check_source_identity(source, source_identity)
+        source_stat = Path(metadata["source_path"]).stat()
+        if (source_stat.st_size, source_stat.st_mtime_ns) != (metadata["source_size_bytes"], metadata["source_mtime_ns"]):
+            raise ProtocolError("VIDEO_SOURCE_CHANGED", "读取期间原视频发生变化，请重试")
+        self._check_project_identity(store, identity)
+        # Duplicate sources are not added twice on retry.
+        for video in store.list_videos():
+            if Path(video["source_path"]).resolve() == Path(metadata["source_path"]).resolve():
+                if video.get("source_fingerprint") != metadata["source_fingerprint"]:
+                    raise ProtocolError("VIDEO_SOURCE_CHANGED", "原视频已变化，请重新定位视频")
+                self._check_source_identity(source, source_identity)
+                begin_commit()
+                return {"video": video}
+        # 外部进程仍可能在最终检查之后（包括提交期间或之后）替换原文件。
+        self._check_source_identity(source, source_identity)
+        begin_commit()
         return {"video": store.link_video(metadata)}
 
     def reorder_videos(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -869,6 +988,8 @@ class EngineService:
         project = store.project()
         if not project:
             raise ProtocolError("PROJECT_INVALID", "项目尚未初始化")
+        identity = self._project_identity(store)
+        previous_video = store.video(video_id)
         with self._job_lock:
             active = store.list_jobs(
                 project_id=project["id"],
@@ -881,21 +1002,54 @@ class EngineService:
                     "视频仍有分析或导出任务运行，请先取消任务后再重新关联",
                     {"job_ids": [job["id"] for job in active]},
                 )
+        source = self._source_path(payload)
+        source_identity = self._source_identity(source)
         metadata = self.inspect_video({"video_path": raw_path})
+        self._check_source_identity(source, source_identity)
+        metadata["source_fingerprint"] = self._source_fingerprint(Path(metadata["source_path"]))
+        self._check_source_identity(source, source_identity)
+        source_stat = Path(metadata["source_path"]).stat()
+        if (source_stat.st_size, source_stat.st_mtime_ns) != (metadata["source_size_bytes"], metadata["source_mtime_ns"]):
+            raise ProtocolError("VIDEO_SOURCE_CHANGED", "读取期间原视频发生变化，请重试")
+        self._check_project_identity(store, identity)
+        if store.video(video_id) != previous_video:
+            raise ProtocolError("PROJECT_CHANGED", "视频已被修改，请重试")
+        self._check_source_identity(source, source_identity)
+        begin_commit()
         try:
             video = store.relink_video(video_id, metadata)
         except (LookupError, ValueError) as exc:
             raise ProtocolError("VIDEO_NOT_FOUND", str(exc)) from exc
         return {"video": video}
 
+    def _preview_frame_vf(self, source: Path) -> str:
+        """抽帧用的 -vf：HDR 源片先做与导出一致的 SDR 色调映射，再缩放。
+
+        判定复用 color_plan（PQ/HLG+10bit+BT.2020 且 ffmpeg 有 zscale/tonemap）；
+        不满足条件时不映射，保持原行为。代理视频是 SDR，不走这里。
+        """
+        try:
+            info = self.inspect_video({"video_path": str(source)})
+            tonemap, warning = color_plan(info)
+            if warning:
+                log_diagnostic(f"preview color warning: {warning}")
+        except (ProtocolError, OSError) as exc:
+            log_diagnostic(f"preview HDR probe failed: {exc}")
+            return "scale=640:-2"
+        if not tonemap:
+            return "scale=640:-2"
+        log_diagnostic(f"preview tonemap enabled: {source.name}")
+        return f"{TONEMAP_FILTER},scale=640:-2"
+
     def extract_preview(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         store = self._require_store(payload)
+        identity = self._project_identity(store)
         video_id = payload.get("video_id")
         video = store.video(video_id) if isinstance(video_id, str) else None
         if not video:
             raise ProtocolError("VIDEO_NOT_FOUND", "预览任务缺少有效视频")
-        # Calibration and review previews share the original source coordinate system.
-        source = self._validated_source(video)
+        # Preview can trust matching file metadata; analysis and export verify content.
+        source = self._validated_source(video, verify_content=False)
         try:
             duration_ms = video.get("duration_ms")
             duration_limit = int(duration_ms) if duration_ms is not None else 1000
@@ -910,28 +1064,86 @@ class EngineService:
             output_path = store.root / output_path
         output_path = output_path.resolve()
         if output_path.is_file() and output_path.stat().st_size > 0:
+            begin_commit()
             return {"path": str(output_path), "time_ms": time_ms}
+        self._check_project_identity(store, identity)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = output_path.with_name(
             f".{output_path.stem}.{os.getpid()}.tmp{output_path.suffix}"
         )
-        command = [
-            resolve_media_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
-            "-ss", f"{time_ms / 1000:.3f}", "-i", str(source),
-            "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "3", str(temporary_path),
-        ]
+        # 分析留下的代理文件小很多，覆盖到的时间点优先用它取帧（16GB 原片每张约 47 秒）；
+        # 代理保持原片宽高比，帧率只有 3–5 帧，预览帧最多偏差一个采样间隔。
+        frame_input, frame_time_ms = source, time_ms
+        proxy = self._latest_proxy_video(store, video["id"])
+        if proxy is not None and proxy[1] <= time_ms < proxy[2] - 1000:
+            try:
+                info = self.inspect_video({"video_path": str(proxy[0])})
+                pw, ph = int(info.get("width") or 0), int(info.get("height") or 0)
+                vw, vh = int(video.get("width") or 0), int(video.get("height") or 0)
+                duration = int(info.get("duration_ms") or 0)
+                if (pw <= 0 or ph <= 0 or vw <= 0 or vh <= 0
+                    or abs(pw / ph - vw / vh) > 0.02
+                    or abs(duration - (proxy[2] - proxy[1])) > 600
+                    or int(info.get("rotation") or 0) != 0):
+                    raise ValueError("proxy geometry or duration invalid")
+                frame_input, frame_time_ms = proxy[0], time_ms - proxy[1]
+            except (ProtocolError, OSError, ValueError, TypeError):
+                check_cancelled()
+        def extract(frame: Path, offset: int) -> None:
+            # 源片可能显 HDR（PQ/HLG），抽帧时与导出同条件映射到 SDR；代理已是 SDR。
+            vf = self._preview_frame_vf(frame) if frame == source else "scale=640:-2"
+            command = [
+                resolve_media_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{offset / 1000:.3f}", "-i", str(frame),
+                "-frames:v", "1", "-vf", vf, "-q:v", "3", str(temporary_path),
+            ]
+            # NAS/共享文件夹上的 4K HEVC 首帧 seek 可能远慢于本地文件,
+            # 20 秒不够;放宽到 60 秒,避免网络视频预览误报失败。
+            check_cancelled()
+            options = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+            if os.name == "nt":
+                options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            else:
+                options["start_new_session"] = True
+            process = subprocess.Popen(command, **options)
+            started = time.monotonic()
+            try:
+                while True:
+                    check_cancelled()
+                    remaining = 60 - (time.monotonic() - started)
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, 60)
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                check_cancelled()
+                if process.returncode:
+                    raise subprocess.CalledProcessError(process.returncode, command, stdout, stderr)
+            finally:
+                if process.poll() is None:
+                    terminate_process(process)
+                process.communicate()
+            if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+                raise OSError("预览帧未生成")
         try:
-            subprocess.run(
-                command,
-                check=True,
-                capture_output=True,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=20,
-            )
+            try:
+                extract(frame_input, frame_time_ms)
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                temporary_path.unlink(missing_ok=True)
+                check_cancelled()
+                if frame_input == source:
+                    raise
+                self._check_project_identity(store, identity)
+                extract(source, time_ms)
+            self._check_project_identity(store, identity)
+            begin_commit()
             temporary_path.replace(output_path)
+        except ProtocolError:
+            temporary_path.unlink(missing_ok=True)
+            raise
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             temporary_path.unlink(missing_ok=True)
             raise ProtocolError("VIDEO_OPEN_FAILED", f"无法提取预览帧: {exc}") from exc
@@ -948,7 +1160,8 @@ class EngineService:
         fingerprint = hashlib.sha256(
             (
                 f"{video.get('source_size_bytes')}:{video.get('source_mtime_ns')}:"
-                f"{video.get('source_path')}"
+                f"{video.get('source_path')}:{video.get('source_fingerprint')}:"
+                f"{video.get('rotation')}:{video.get('analysis_start_ms')}:{video.get('analysis_end_ms')}"
             ).encode("utf-8")
         ).hexdigest()[:12]
         return (
@@ -986,10 +1199,12 @@ class EngineService:
             temporary_path = output_path.with_name(
                 f".{output_path.stem}.{job_id}.{index}.tmp{output_path.suffix}"
             )
+            # 分析结束后对原片抽候选封面：HDR 源与导出同条件映射到 SDR，避免过曝。
+            vf = self._preview_frame_vf(source)
             command = [
                 resolve_media_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
                 "-ss", f"{time_ms / 1000:.3f}", "-i", str(source),
-                "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "3",
+                "-frames:v", "1", "-vf", vf, "-q:v", "3",
                 str(temporary_path),
             ]
             popen_kwargs: Dict[str, Any] = {
@@ -1258,7 +1473,7 @@ class EngineService:
         retry_payload = {
             "project_root": str(store.root),
             "video_id": job.get("video_id"),
-            "mode": checkpoint.get("mode", "standard"),
+            "mode": checkpoint.get("mode", "separate"),
         }
         if checkpoint.get("output_dir") is not None:
             retry_payload["output_dir"] = checkpoint["output_dir"]
@@ -1274,6 +1489,7 @@ class EngineService:
         video_id = retry_payload["video_id"]
         if not store.project() or (video_id is not None and not store.video(video_id)):
             raise ProtocolError("VIDEO_NOT_FOUND", "导出任务缺少有效视频")
+        self._export_candidate_snapshot(store, video_id, retry_payload)
         self._export_videos(store, retry_payload.get("_retry_snapshot") or
             self._export_candidate_snapshot(store, video_id, retry_payload)[2])
         if job.get("state") in {"running", "queued"}:
@@ -1302,24 +1518,7 @@ class EngineService:
         if len(traj) < 3 or "rim_y" not in rim or "center_x" not in rim:
             return None
         rim_y = float(rim["rim_y"])
-        crossing = None
-        for a, b in zip(traj, traj[1:]):
-            span = float(b["y"]) - float(a["y"])
-            if abs(span) > 1e-6 and float(a["y"]) <= rim_y <= float(b["y"]):
-                t = (rim_y - float(a["y"])) / span
-                crossing = {
-                    "x": round(
-                        float(a["x"]) + (float(b["x"]) - float(a["x"])) * t, 1
-                    ),
-                    "y": round(rim_y, 1),
-                    "time": round(
-                        float(a["time"])
-                        + (float(b["time"]) - float(a["time"])) * t,
-                        3,
-                    ),
-                    "valid": False,
-                }
-                break
+        crossing = trajectory_crossing(traj, rim_y, float(match["time"]))
         return {
             "rim": {
                 "center_x": round(float(rim.get("center_x", 0.0)), 1),
@@ -1479,7 +1678,9 @@ class EngineService:
             else:
                 proxy_width = int(payload.get("proxy_width", 960))
                 proxy_height = int(payload.get("proxy_height", 720))
-                proxy_fps = float(payload.get("proxy_fps", 5))
+                # 10fps:5fps 下一次出手常只留单侧检测点,配不成筐上/下对,
+                # 小球/远景/集锦视频大量漏检;翻倍采样实测把候选从 2 提到 5。
+                proxy_fps = float(payload.get("proxy_fps", 10))
             source_width = int(video.get("width") or 0)
             source_height = int(video.get("height") or 0)
             if source_width <= 0 or source_height <= 0:
@@ -1512,6 +1713,8 @@ class EngineService:
                 "source_path": str(source_video),
                 "source_size_bytes": video.get("source_size_bytes"),
                 "source_mtime_ns": video.get("source_mtime_ns"),
+                "source_fingerprint": video.get("source_fingerprint"),
+                "source_rotation": int(video.get("rotation") or 0),
                 "model_path": str(model_path),
                 "model_mtime_ns": model_path.stat().st_mtime_ns,
                 "roi": source_roi,
@@ -1711,7 +1914,7 @@ class EngineService:
                     # 优先使用精化阶段已扫出的高清轨迹;不可用时退回
                     # 粗扫记录的速度门限串联轨迹。
                     overlay = None
-                    for fallback in refined_fallbacks:
+                    for fallback in sorted(refined_fallbacks, key=lambda item: abs(item["time"] - extra_time)):
                         if abs(fallback["time"] - extra_time) <= 1.0:
                             overlay = self._refined_fallback_overlay(
                                 extra, fallback,
@@ -1729,7 +1932,7 @@ class EngineService:
                     if overlay is not None:
                         extra["overlay"] = overlay
                     matches.append(extra)
-                matches.sort(key=lambda match: float(match["time"]))
+                matches = dedupe_trajectory_matches(matches)
                 self._verify_rim_crossings(
                     repo_root=repo_root,
                     source_video=source_video,
@@ -1793,10 +1996,15 @@ class EngineService:
                 (time.perf_counter() - preview_started) * 1000
             )
             preview_counts["deferred"] = len(rows) - len(eager_preview_rows)
-            if cancel_event and cancel_event.is_set():
-                raise PipelineCancelled("JOB_CANCELLED")
+            def abort_if_cancelled() -> None:
+                if cancel_event and cancel_event.is_set():
+                    raise PipelineCancelled("JOB_CANCELLED")
+
+            abort_if_cancelled()
             persist_started = time.perf_counter()
-            store.replace_candidates(video_id, rows)
+            # 取消检查放进写库事务、提交之前：要么候选和审核继承一起生效，要么整个回滚，
+            # 不会留下「新候选已写入却报已取消」的半截状态。
+            store.replace_candidates(video_id, rows, before_commit=abort_if_cancelled)
             stage_timings_ms["persist_candidates"] = round(
                 (time.perf_counter() - persist_started) * 1000
             )
@@ -2010,6 +2218,9 @@ class EngineService:
         if job["state"] in {"completed", "failed", "cancelled"}:
             return {"job": job}
         with self._job_lock:
+            job = store.get_job(job_id) or job
+            if job["state"] in {"completed", "failed", "cancelled"}:
+                return {"job": job}
             cancel_event = self._job_cancel_events.get(job_id)
             processes = set(self._job_processes.get(job_id, set()))
             if cancel_event:
@@ -2308,6 +2519,9 @@ class EngineService:
         progress_callback=None,
         cancel_check=None,
         process_callback=None,
+        job_id=None,
+        project_identity=None,
+        job_checkpoint=None,
     ) -> Dict[str, Any]:
         store = self._require_store(payload)
         project = store.project()
@@ -2324,7 +2538,22 @@ class EngineService:
         ]
         if not candidates:
             raise ProtocolError("NO_EXPORT_CANDIDATES", "没有可导出的候选片段")
+        if progress_callback:
+            progress_callback("validate_source", 0.01)
         videos = self._export_videos(store, candidates)
+        source_identities = {key: self._source_identity(video["source"]) for key, video in videos.items()}
+        source_unverified = any(not video.get("source_fingerprint") for video in videos.values())
+        color_warnings = set()
+        for video in videos.values():
+            try:
+                color_info = self.inspect_video({"video_path": str(video["source"])})
+                video["tonemap"], warning = color_plan(color_info)
+            except (ProtocolError, OSError) as exc:
+                video["tonemap"], warning = False, HDR_UNKNOWN
+                log_diagnostic(f"export HDR probe failed: {exc}")
+            if warning:
+                color_warnings.add(warning)
+                log_diagnostic(f"export color warning: {warning}")
         for candidate in candidates:
             video = videos[candidate["video_id"]]
             candidate["source_path"] = str(video["source"])
@@ -2332,6 +2561,7 @@ class EngineService:
             candidate["height"] = video.get("height")
             candidate["fps"] = video.get("fps")
             candidate["has_audio"] = bool(video.get("audio_codec"))
+            candidate["tonemap"] = video.get("tonemap", False)
         mode = payload.get("mode", "separate")
         effect = payload.get("effect", "none")
         if effect not in EFFECTS:
@@ -2367,6 +2597,9 @@ class EngineService:
                 merged_output = validate_output_file(merged_output)
         except OSError as exc:
             raise ProtocolError("EXPORT_PATH_INVALID", str(exc)) from exc
+        final_output = merged_output
+        if merged_output is not None and mode == "merge":
+            merged_output = merged_output.with_name(f".{merged_output.stem}.{new_id('stage')}.mp4")
         try:
             if mode == "merge_by_player":
                 result = self._export_merged_per_player(
@@ -2393,53 +2626,109 @@ class EngineService:
                 )
         except (OSError, ValueError, subprocess.CalledProcessError) as exc:
             raise ProtocolError("EXPORT_FAILED", f"导出失败: {exc}") from exc
-        if cancel_check and cancel_check():
-            for path in {
-                *result.get("files", []),
-                *result.get("clip_files", []),
-            }:
-                Path(path).unlink(missing_ok=True)
-            raise PipelineCancelled("JOB_CANCELLED")
         try:
-            for video in videos.values():
-                self._validated_source(video)
-        except ProtocolError:
-            for path in {
-                *result.get("files", []),
-                *result.get("clip_files", []),
-            }:
+            if cancel_check and cancel_check():
+                for path in {
+                    *result.get("files", []),
+                    *result.get("clip_files", []),
+                }:
+                    Path(path).unlink(missing_ok=True)
+                raise PipelineCancelled("JOB_CANCELLED")
+            try:
+                if progress_callback:
+                    progress_callback("verify_source", 0.99)
+                for key, video in videos.items():
+                    self._validated_source(video)
+                    self._check_source_identity(video["source"], source_identities[key])
+                if project_identity is not None:
+                    self._check_project_identity(store, project_identity)
+            except (ProtocolError, PipelineCancelled):
+                for path in {
+                    *result.get("files", []),
+                    *result.get("clip_files", []),
+                }:
+                    Path(path).unlink(missing_ok=True)
+                raise
+            file_size = sum(Path(path).stat().st_size for path in result["files"] if Path(path).is_file())
+            export_path = result["files"][0] if len(result["files"]) == 1 else str(output_dir)
+            exported_info: Dict[str, Any] = {}
+            if result["files"]:
+                try:
+                    exported_info = self.inspect_video({"video_path": result["files"][0]})
+                except ProtocolError:
+                    exported_info = {}
+            export_values = {
+                "project_id": project["id"],
+                "video_id": video_id,
+                "output_path": export_path,
+                "mode": mode,
+                "candidate_count": len(candidates),
+                "duration_ms": result["duration_ms"],
+                "file_size_bytes": file_size,
+                "width": exported_info.get("width"),
+                "height": exported_info.get("height"),
+                "video_codec": exported_info.get("video_codec"),
+                "audio_codec": exported_info.get("audio_codec"),
+                "processing_ms": result["processing_ms"],
+                "export_ms": result["processing_ms"],
+                "algorithm_version": ANALYSIS_ALGORITHM_VERSION,
+                "metadata": {
+                    "files": result["files"],
+                    "clip_files": result["clip_files"],
+                    "merged_overlap_count": result["merged_overlap_count"],
+                    **({"color_warnings": sorted(color_warnings)} if color_warnings else {}),
+                    **({"source_unverified": True} if source_unverified else {}),
+                },
+            }
+            def publish():
+                backup = None
+                published = False
+                try:
+                    if final_output is not None and merged_output != final_output and mode == "merge":
+                        if final_output.exists() or final_output.is_symlink():
+                            backup = final_output.with_name(f".{final_output.name}.{new_id('backup')}")
+                            final_output.replace(backup)
+                        merged_output.replace(final_output)
+                        published = True
+                        export_values["output_path"] = str(final_output)
+                        export_values["metadata"]["files"] = [str(final_output)]
+                    export = (store.create_export(export_values) if job_id is None else
+                              store.complete_export_job(export_values, job_id, job_checkpoint or {}))
+                except Exception:
+                    if published:
+                        final_output.unlink(missing_ok=True)
+                    if backup is not None:
+                        backup.replace(final_output)
+                    raise
+                if backup is not None:
+                    try:
+                        backup.unlink(missing_ok=True)
+                    except OSError as exc:
+                        log_diagnostic(f"export backup cleanup failed: {exc}")
+                if published:
+                    result["files"] = [str(final_output)]
+                return export
+
+            try:
+                if job_id is None:
+                    export = publish()
+                else:
+                    with self._job_lock:
+                        if cancel_check and cancel_check():
+                            raise PipelineCancelled("JOB_CANCELLED")
+                        self._check_project_identity(store, project_identity)
+                        for key, video in videos.items():
+                            self._check_source_identity(video["source"], source_identities[key])
+                        export = publish()
+            except Exception:
+                for path in {*result.get("files", []), *result.get("clip_files", [])}:
+                    Path(path).unlink(missing_ok=True)
+                raise
+            return {"export": export, "files": result["files"]}
+        except Exception:
+            for path in {*result.get("files", []), *result.get("clip_files", [])}:
                 Path(path).unlink(missing_ok=True)
             raise
-        file_size = sum(Path(path).stat().st_size for path in result["files"] if Path(path).is_file())
-        export_path = result["files"][0] if len(result["files"]) == 1 else str(output_dir)
-        exported_info: Dict[str, Any] = {}
-        if result["files"]:
-            try:
-                exported_info = self.inspect_video({"video_path": result["files"][0]})
-            except ProtocolError:
-                exported_info = {}
-        export = store.create_export({
-            "project_id": project["id"],
-            "video_id": video_id,
-            "output_path": export_path,
-            "mode": mode,
-            "candidate_count": len(candidates),
-            "duration_ms": result["duration_ms"],
-            "file_size_bytes": file_size,
-            "width": exported_info.get("width"),
-            "height": exported_info.get("height"),
-            "video_codec": exported_info.get("video_codec"),
-            "audio_codec": exported_info.get("audio_codec"),
-            "processing_ms": result["processing_ms"],
-            "export_ms": result["processing_ms"],
-            "algorithm_version": ANALYSIS_ALGORITHM_VERSION,
-            "metadata": {
-                "files": result["files"],
-                "clip_files": result["clip_files"],
-                "merged_overlap_count": result["merged_overlap_count"],
-            },
-        })
-        return {"export": export, "files": result["files"]}
 
     def _export_merged_per_player(
         self,
@@ -2620,6 +2909,8 @@ class EngineService:
     def start_export(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if payload.get("effect", "none") not in EFFECTS:
             raise ProtocolError("INVALID_REQUEST", "effect 必须是 none、approach 或 replay")
+        if payload.get("mode", "separate") not in {"separate", "merge", "merge_by_player"}:
+            raise ProtocolError("INVALID_REQUEST", "导出方式无效")
         store = self._require_store(payload)
         project = store.project()
         video_id = payload.get("video_id")
@@ -2640,6 +2931,9 @@ class EngineService:
                     "项目存在未完成的分析或导出任务，请先恢复、重试或取消该任务",
                     {"job_ids": [item["id"] for item in active]},
                 )
+            requested_player_ids, include_unassigned, candidate_snapshot = (
+                self._export_candidate_snapshot(store, video_id, payload)
+            )
             requested_player_ids = payload.get("player_ids")
             include_unassigned = payload.get("include_unassigned", True) is True
             candidate_snapshot = payload.get("_retry_snapshot")
@@ -2667,32 +2961,42 @@ class EngineService:
                 "candidate_snapshot": candidate_snapshot,
                 "candidate_count": len(candidate_snapshot),
             }
-            job = store.create_job(project["id"], video_id, "export", checkpoint)
-            job_id = job["id"]
-            worker_payload = {
-                **payload,
-                "candidate_snapshot": candidate_snapshot,
-            }
-            thread = threading.Thread(
-                target=self._run_export,
-                args=(worker_payload, job_id),
-                name=f"export-{job_id}",
-                daemon=True,
-            )
-            self._job_threads[job_id] = thread
-            self._job_cancel_events[job_id] = threading.Event()
+            project_identity = self._project_identity(store)
+            ready = threading.Event()
+            aborted = threading.Event()
+            job_id = None
+            def run_after_commit(worker_payload, new_job_id):
+                ready.wait()
+                if not aborted.is_set():
+                    self._run_export(worker_payload, new_job_id)
             try:
-                thread.start()
-            except RuntimeError as exc:
-                self._job_threads.pop(job_id, None)
-                self._job_cancel_events.pop(job_id, None)
-                store.update_job(
-                    job_id,
-                    state="failed",
-                    stage="export",
-                    error_code="EXPORT_FAILED",
-                    error_message=str(exc),
-                )
+                # The worker waits until this transaction commits; startup failure rolls back the job.
+                with store.connect() as connection:
+                    job = store.create_job(project["id"], video_id, "export", checkpoint, connection=connection)
+                    job_id = job["id"]
+                    worker_payload = {
+                        **payload,
+                        "candidate_snapshot": candidate_snapshot,
+                        "_project_identity": project_identity,
+                    }
+                    self._export_projects[str(store.root)] = job_id
+                    thread = threading.Thread(
+                        target=run_after_commit,
+                        args=(worker_payload, job_id),
+                        name=f"export-{job_id}",
+                        daemon=True,
+                    )
+                    self._job_threads[job_id] = thread
+                    self._job_cancel_events[job_id] = threading.Event()
+                    thread.start()
+            except Exception as exc:
+                aborted.set()
+                ready.set()
+                if job_id is not None:
+                    self._job_threads.pop(job_id, None)
+                    self._job_cancel_events.pop(job_id, None)
+                    if self._export_projects.get(str(store.root)) == job_id:
+                        self._export_projects.pop(str(store.root), None)
                 raise ProtocolError("EXPORT_FAILED", "无法启动导出任务") from exc
         return {"job": job}
 

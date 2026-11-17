@@ -1,10 +1,13 @@
 // lib/components/cs_scaffold.dart
+import '../features/review/review_shortcuts.dart';
+import '../providers/onboarding_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:bhe_l10n/bhe_l10n.dart';
 
+import '../core/app_log.dart';
 import '../providers/session_provider.dart';
 import '../providers/project_state.dart';
 import '../providers/locale_provider.dart';
@@ -139,6 +142,21 @@ class CsTopBar extends ConsumerWidget {
             ),
             const SizedBox(width: Spacing.md),
           ],
+          if (shell.currentIndex >= 1 && shell.currentIndex <= 3)
+            IconButton(
+              key: const Key('onboarding-help'),
+              tooltip: context.bheText('本页新手引导'),
+              icon: Icon(LucideIcons.helpCircle, size: 18, color: c.textSecondary),
+              onPressed: () => ref
+                  .read(onboardingProvider.notifier)
+                  .replay(
+                    switch (shell.currentIndex) {
+                      1 => onboardingImportPage,
+                      2 => onboardingReviewPage,
+                      _ => onboardingExportPage,
+                    },
+                  ),
+            ),
           PopupMenuButton<String>(
             key: feedbackMenuKey,
             tooltip: l10n?.more ?? '更多',
@@ -147,11 +165,19 @@ class CsTopBar extends ConsumerWidget {
               size: 18,
               color: c.textSecondary,
             ),
-            onSelected: (value) => _handleUtilityAction(context, value),
+            onSelected: (value) => _handleUtilityAction(context, ref, value),
             itemBuilder: (context) => [
               PopupMenuItem(
                 value: 'feedback',
                 child: Text(l10n?.feedback ?? '反馈'),
+              ),
+              PopupMenuItem(
+                value: 'shortcuts',
+                child: Text(context.bheText('快捷键一览')),
+              ),
+              PopupMenuItem(
+                value: 'reset-onboarding',
+                child: Text(context.bheText('重置新手引导')),
               ),
               PopupMenuItem(
                 value: 'about',
@@ -171,16 +197,15 @@ class CsTopBar extends ConsumerWidget {
               color: c.textSecondary,
             ),
             onPressed: () {
-              ref
-                  .read(themeModeProvider.notifier)
-                  .set(_nextThemeMode(themeMode));
+              ref.read(themeModeProvider.notifier).set(_nextThemeMode(themeMode));
             },
           ),
           PopupMenuButton<Locale>(
             tooltip: l10n?.switchLanguage ?? '切换语言',
             icon: Icon(LucideIcons.languages, size: 18, color: c.textSecondary),
-            onSelected: (locale) =>
-                ref.read(appLocaleProvider.notifier).set(locale),
+            onSelected: (locale) {
+              ref.read(appLocaleProvider.notifier).set(locale);
+            },
             itemBuilder: (context) => [
               PopupMenuItem(
                 value: BheLocale.zh,
@@ -208,11 +233,34 @@ class CsTopBar extends ConsumerWidget {
     }
   }
 
-  Future<void> _handleUtilityAction(BuildContext context, String value) async {
+  Future<void> _handleUtilityAction(
+    BuildContext context,
+    WidgetRef ref,
+    String value,
+  ) async {
+    if (value == 'reset-onboarding') {
+      appLog('info', 'settings', '重置新手引导');
+      await ref.read(onboardingProvider.notifier).reset();
+      if (context.mounted) {
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+          SnackBar(
+            content: Text(context.bheText('已重置，下次进入审核页和导出页会再次显示新手引导')),
+          ),
+        );
+      }
+      return;
+    }
+    if (value == 'shortcuts') {
+      appLog('info', 'settings', '打开快捷键一览');
+      await showReviewShortcutsDialog(context);
+      return;
+    }
     if (value == 'about') {
+      appLog('info', 'settings', '打开关于');
       await showCourtsideAboutDialog(context);
       return;
     }
+    appLog('info', 'feedback', '打开反馈');
     await showFeedbackDialog(context);
   }
 }
@@ -262,6 +310,11 @@ Future<void> _confirmCloseProject(
         ),
       ],
     ),
+  );
+  appLog(
+    'info',
+    'project',
+    '关闭项目 用户选择=${confirmed == true ? '关闭' : '返回'} 分析中=$analyzing 导出中=$exporting 忙=$busy',
   );
   if (confirmed != true || !context.mounted) return;
   final closed = busy
