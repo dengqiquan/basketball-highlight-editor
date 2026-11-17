@@ -374,8 +374,12 @@ class ProjectNotifier extends Notifier<ProjectState> {
             await session.createProject(name: stem, rootPath: projectRoot);
           } on EngineException catch (error) {
             final fallback = fallbackProjectsRoot(Platform.environment);
-            if (!const {'FILE_NOT_FOUND', 'FILE_ACCESS_DENIED'}.contains(error.code) ||
-                canonicalProjectPath(knownRoot) == canonicalProjectPath(fallback)) {
+            if (!const {
+                  'FILE_NOT_FOUND',
+                  'FILE_ACCESS_DENIED',
+                }.contains(error.code) ||
+                canonicalProjectPath(knownRoot) ==
+                    canonicalProjectPath(fallback)) {
               rethrow;
             }
             // 默认目录被安全软件拦截、或「视频」文件夹失效时建不了项目，改存到应用数据目录。
@@ -980,7 +984,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
           : _normalizeRoi(storedNetRoi.cast<String, dynamic>(), video);
       final restoredRoiSource = calibration?['source']?.toString() ?? 'manual';
       _applyVideoContext(payload);
-      if (((payload['orientation_corrected'] as List?) ?? const []).isNotEmpty) {
+      if (((payload['orientation_corrected'] as List?) ?? const [])
+          .isNotEmpty) {
         ref
             .read(noticeProvider.notifier)
             .push(
@@ -1122,7 +1127,9 @@ class ProjectNotifier extends Notifier<ProjectState> {
         final latestExportJob = jobs[3] as JsonMap?;
         state = state.copyWith(
           // 加载期间用户可能已经开始排队分析，不能用旧结果覆盖正在跑的任务。
-          job: state.analysisRunning ? state.job : analysisJob ?? latestAnalysisJob,
+          job: state.analysisRunning
+              ? state.job
+              : analysisJob ?? latestAnalysisJob,
           exportJob: activeExportJob ?? latestExportJob,
           analysisMode:
               _jobAnalysisMode(analysisJob ?? latestAnalysisJob) ??
@@ -1243,7 +1250,11 @@ class ProjectNotifier extends Notifier<ProjectState> {
     ref.read(projectSessionProvider).setActiveVideo(videoId);
     final video = <String, dynamic>{
       for (final entry in summary.entries)
-        if (!const {'roi', 'analysis_job', 'candidate_count'}.contains(entry.key))
+        if (!const {
+          'roi',
+          'analysis_job',
+          'candidate_count',
+        }.contains(entry.key))
           entry.key: entry.value,
     };
     final roi = (summary['roi'] as Map?)?.cast<String, dynamic>();
@@ -1260,9 +1271,13 @@ class ProjectNotifier extends Notifier<ProjectState> {
       previewTimeMs: _previewTimeForVideo(video),
       previewRefreshing: false,
       suggestedRoi: roi == null ? null : _normalizeRoi(roi, video),
-      netRoi: net is Map ? _normalizeRoi(net.cast<String, dynamic>(), video) : null,
+      netRoi: net is Map
+          ? _normalizeRoi(net.cast<String, dynamic>(), video)
+          : null,
       hoopBbox: hoop is List ? _normalizeBbox(hoop, video) : null,
-      roiSource: roi == null ? null : calibration?['source']?.toString() ?? 'manual',
+      roiSource: roi == null
+          ? null
+          : calibration?['source']?.toString() ?? 'manual',
       roiConfidence: (calibration?['confidence'] as num?)?.toDouble(),
       roiSuggestionError: null,
     );
@@ -1280,14 +1295,18 @@ class ProjectNotifier extends Notifier<ProjectState> {
       await ref.read(engineBootstrapProvider.notifier).ensure();
       for (final path in paths) {
         final payload = await session.inspectVideo(videoPath: path);
-        inspected.add((payload['video'] as Map?)?.cast<String, dynamic>() ?? payload);
+        inspected.add(
+          (payload['video'] as Map?)?.cast<String, dynamic>() ?? payload,
+        );
       }
     } catch (error) {
       _pushNotice(error.toString(), NoticeSeverity.error);
       return;
     }
     inspected.sort(compareByRecordingTime);
-    final ordered = [for (final video in inspected) video['source_path'].toString()];
+    final ordered = [
+      for (final video in inspected) video['source_path'].toString(),
+    ];
     await selectVideo(ordered.first);
     final first = state.videos.firstOrNull;
     if (first == null) return;
@@ -1310,7 +1329,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
       final inspected = <JsonMap>[];
       for (final path in paths) {
         final payload = await session.inspectVideo(videoPath: path);
-        final metadata = (payload['video'] as Map?)?.cast<String, dynamic>() ?? payload;
+        final metadata =
+            (payload['video'] as Map?)?.cast<String, dynamic>() ?? payload;
         final source = metadata['source_path']?.toString();
         if (existing.add(source)) inspected.add(metadata);
       }
@@ -1320,7 +1340,9 @@ class ProjectNotifier extends Notifier<ProjectState> {
           busyMessage: '正在添加第 ${index + 1}/${inspected.length} 段视频…',
         );
         final previous = state.videos.isEmpty ? null : state.videos.last;
-        final linked = await session.addVideo(metadata['source_path'].toString());
+        final linked = await session.addVideo(
+          metadata['source_path'].toString(),
+        );
         final video = (linked['video'] as Map).cast<String, dynamic>();
         await _calibrateAddedVideo(video, previous);
         await refreshVideos();
@@ -1334,7 +1356,9 @@ class ProjectNotifier extends Notifier<ProjectState> {
     final session = ref.read(projectSessionProvider);
     final videoId = video['id'].toString();
     final previousRoi = (previous?['roi'] as Map?)?.cast<String, dynamic>();
-    if (previous != null && previousRoi != null && continuesRecording(previous, video)) {
+    if (previous != null &&
+        previousRoi != null &&
+        continuesRecording(previous, video)) {
       await session.saveRoi(
         videoId: videoId,
         x1: previousRoi['x1'] as num,
@@ -1364,7 +1388,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
       return;
     }
     final roi = (suggestion['roi'] as Map?)?.cast<String, dynamic>();
-    final calibration = (suggestion['calibration'] as Map?)?.cast<String, dynamic>();
+    final calibration = (suggestion['calibration'] as Map?)
+        ?.cast<String, dynamic>();
     if (roi == null || calibration == null) return;
     final width = (video['width'] as num?)?.toDouble() ?? 0;
     final height = (video['height'] as num?)?.toDouble() ?? 0;
@@ -1423,7 +1448,10 @@ class ProjectNotifier extends Notifier<ProjectState> {
         y2: roi['y2'] as num,
         calibration: calibration,
       );
-      previous = {...next, 'roi': {...roi, 'calibration': calibration}};
+      previous = {
+        ...next,
+        'roi': {...roi, 'calibration': calibration},
+      };
     }
     await refreshVideos();
   }
@@ -1472,7 +1500,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
 
   /// 从队列移除还没开始的视频段；正在分析的那段需要先取消。
   Future<void> removeFromAnalysisQueue(String videoId) async {
-    if (state.analysisRunning && state.analysisQueue.firstOrNull == videoId) return;
+    if (state.analysisRunning && state.analysisQueue.firstOrNull == videoId)
+      return;
     await _saveAnalysisQueue([
       for (final id in state.analysisQueue)
         if (id != videoId) id,
@@ -1486,11 +1515,9 @@ class ProjectNotifier extends Notifier<ProjectState> {
   }) async {
     final before = beforeSeconds ?? state.queueBeforeSeconds;
     final after = afterSeconds ?? state.queueAfterSeconds;
-    await ref.read(projectSessionProvider).setAnalysisQueue(
-      videoIds,
-      beforeSeconds: before,
-      afterSeconds: after,
-    );
+    await ref
+        .read(projectSessionProvider)
+        .setAnalysisQueue(videoIds, beforeSeconds: before, afterSeconds: after);
     state = state.copyWith(
       analysisQueue: videoIds,
       queueBeforeSeconds: before,
@@ -2014,8 +2041,8 @@ class ProjectNotifier extends Notifier<ProjectState> {
         target.isEmpty ||
         target == ref.read(projectSessionProvider).projectRoot;
     if (isCurrent) {
-      final current =
-          (state.statistics?['project'] as Map?)?['name']?.toString();
+      final current = (state.statistics?['project'] as Map?)?['name']
+          ?.toString();
       if (current == trimmed) return true;
     }
     try {
@@ -2496,6 +2523,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
 
   Future<void> export(
     String mode, {
+    String? referencePlayerId,
     String? outputDir,
     String? outputPath,
     List<String>? playerIds,
@@ -2506,6 +2534,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
     if (state.analysisRunning && state.analysisQueue.isNotEmpty) {
       _queuedExport = () => export(
         mode,
+        referencePlayerId: referencePlayerId,
         outputDir: outputDir,
         outputPath: outputPath,
         playerIds: playerIds,
@@ -2523,6 +2552,7 @@ class ProjectNotifier extends Notifier<ProjectState> {
           .read(projectSessionProvider)
           .startExport(
             mode: mode,
+            referencePlayerId: referencePlayerId,
             outputDir: outputDir,
             outputPath: outputPath,
             playerIds: playerIds,

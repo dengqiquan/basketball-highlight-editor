@@ -9,6 +9,14 @@ from engine.python.basketball_engine.adapters.analysis import PipelineCancelled
 from engine.python.basketball_engine.media_tools import resolve_media_tool
 
 
+def test_balanced_overlap_merge_keeps_player_groups():
+    clips = [
+        {"id": "a", "player_id": "a", "source_path": "video.mp4", "review_start_ms": 0, "review_end_ms": 1000},
+        {"id": "b", "player_id": "b", "source_path": "video.mp4", "review_start_ms": 500, "review_end_ms": 1500},
+    ]
+    assert [clip["id"] for clip in export.merge_overlapping_candidates_by_player(clips)] == ["a", "b"]
+
+
 @pytest.fixture
 def sources(tmp_path):
     paths = []

@@ -4,6 +4,7 @@ import json
 import hashlib
 import math
 import os
+import random
 import sqlite3
 import shutil
 import subprocess
@@ -1263,18 +1264,18 @@ class EngineService:
             retry_payload["output_dir"] = checkpoint["output_dir"]
         if checkpoint.get("output_path") is not None:
             retry_payload["output_path"] = checkpoint["output_path"]
-        for key in ("player_ids", "include_unassigned", "effect"):
+        for key in ("player_ids", "include_unassigned", "effect", "reference_player_id"):
             if key in checkpoint:
                 retry_payload[key] = checkpoint[key]
+        if checkpoint.get("mode") == "merge_balanced":
+            retry_payload["_retry_snapshot"] = checkpoint.get("candidate_snapshot")
         # Check what start_export would reject before ending the old job, so a
         # failed retry leaves the interrupted job retryable.
         video_id = retry_payload["video_id"]
         if not store.project() or (video_id is not None and not store.video(video_id)):
             raise ProtocolError("VIDEO_NOT_FOUND", "导出任务缺少有效视频")
-        self._export_videos(
-            store,
-            self._export_candidate_snapshot(store, video_id, retry_payload)[2],
-        )
+        self._export_videos(store, retry_payload.get("_retry_snapshot") or
+            self._export_candidate_snapshot(store, video_id, retry_payload)[2])
         if job.get("state") in {"running", "queued"}:
             store.update_job(
                 job_id,
@@ -2382,12 +2383,13 @@ class EngineService:
                 result = export_goal_clips(
                     candidates,
                     output_dir,
-                    mode,
+                    "merge" if mode == "merge_balanced" else mode,
                     merged_output,
                     progress_callback=progress_callback,
                     cancel_check=cancel_check,
                     process_callback=process_callback,
                     effect=effect,
+                    keep_player_groups=mode == "merge_balanced",
                 )
         except (OSError, ValueError, subprocess.CalledProcessError) as exc:
             raise ProtocolError("EXPORT_FAILED", f"导出失败: {exc}") from exc
@@ -2554,6 +2556,25 @@ class EngineService:
         return None
 
     @staticmethod
+    def _balanced_export_snapshot(
+        candidates: list[Dict[str, Any]], reference_player_id: str,
+    ) -> list[Dict[str, Any]]:
+        groups: Dict[str | None, list[Dict[str, Any]]] = {}
+        for candidate in candidates:
+            groups.setdefault(candidate.get("player_id"), []).append(candidate)
+        count = len(groups.get(reference_player_id, []))
+        if not count:
+            raise ProtocolError("INVALID_REQUEST", "基准标签没有可导出的片段")
+        ordered = []
+        for group in groups.values():
+            chosen_ids = {
+                item["id"]
+                for item in (random.sample(group, count) if len(group) > count else group)
+            }
+            ordered.extend(item for item in group if item["id"] in chosen_ids)
+        return ordered
+
+    @staticmethod
     def _export_candidate_snapshot(
         store: ProjectStore,
         video_id: str,
@@ -2578,6 +2599,7 @@ class EngineService:
                 "review_start_ms": int(candidate["review_start_ms"]),
                 "review_end_ms": int(candidate["review_end_ms"]),
                 "player_name": candidate.get("player_name"),
+                "player_id": candidate.get("player_id"),
                 "rim": EngineService._candidate_rim(store, candidate),
                 "manual": str(candidate.get("detector_version") or "").startswith("manual"),
                 "review_status": candidate.get("review_status"),
@@ -2618,9 +2640,20 @@ class EngineService:
                     "项目存在未完成的分析或导出任务，请先恢复、重试或取消该任务",
                     {"job_ids": [item["id"] for item in active]},
                 )
-            requested_player_ids, include_unassigned, candidate_snapshot = (
-                self._export_candidate_snapshot(store, video_id, payload)
-            )
+            requested_player_ids = payload.get("player_ids")
+            include_unassigned = payload.get("include_unassigned", True) is True
+            candidate_snapshot = payload.get("_retry_snapshot")
+            if candidate_snapshot is None:
+                requested_player_ids, include_unassigned, candidate_snapshot = (
+                    self._export_candidate_snapshot(store, video_id, payload)
+                )
+                if payload.get("mode") == "merge_balanced":
+                    reference_id = payload.get("reference_player_id")
+                    if not isinstance(reference_id, str) or not reference_id:
+                        raise ProtocolError("INVALID_REQUEST", "请选择基准标签")
+                    if requested_player_ids is not None and reference_id not in requested_player_ids:
+                        raise ProtocolError("INVALID_REQUEST", "基准标签必须在导出范围内")
+                    candidate_snapshot = self._balanced_export_snapshot(candidate_snapshot, reference_id)
             self._export_videos(store, candidate_snapshot)
             selected_players = set(requested_player_ids or [])
             checkpoint = {
@@ -2630,6 +2663,7 @@ class EngineService:
                 "player_ids": sorted(selected_players) if requested_player_ids is not None else None,
                 "include_unassigned": include_unassigned,
                 "effect": payload.get("effect", "none"),
+                "reference_player_id": payload.get("reference_player_id"),
                 "candidate_snapshot": candidate_snapshot,
                 "candidate_count": len(candidate_snapshot),
             }

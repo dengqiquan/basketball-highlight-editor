@@ -16,6 +16,86 @@ from engine.python.basketball_engine.storage import ProjectStore
 from engine.python.basketball_engine.protocol import ProtocolError, parse_request
 
 
+def test_balanced_export_samples_each_tag_to_reference_count():
+    candidates = [
+        {"id": f"a{i}", "player_id": "a"} for i in range(3)
+    ] + [
+        {"id": f"b{i}", "player_id": "b"} for i in range(5)
+    ] + [
+        {"id": f"c{i}", "player_id": "c"} for i in range(2)
+    ]
+    sampled = EngineService._balanced_export_snapshot(candidates, "a")
+    assert [item["id"] for item in sampled if item["player_id"] == "a"] == ["a0", "a1", "a2"]
+    assert len([item for item in sampled if item["player_id"] == "b"]) == 3
+    assert {item["id"] for item in sampled if item["player_id"] == "c"} == {"c0", "c1"}
+    assert len({item["id"] for item in sampled}) == 8
+
+
+def test_balanced_export_keeps_each_tag_together_in_original_order():
+    candidates = [
+        {"id": "a0", "player_id": "a"},
+        {"id": "b0", "player_id": "b"},
+        {"id": "a1", "player_id": "a"},
+        {"id": "b1", "player_id": "b"},
+    ]
+    sampled = EngineService._balanced_export_snapshot(candidates, "a")
+    assert [item["id"] for item in sampled] == ["a0", "a1", "b0", "b1"]
+
+
+def test_balanced_export_requires_nonempty_reference():
+    with pytest.raises(ProtocolError):
+        EngineService._balanced_export_snapshot([{"id": "b", "player_id": "b"}], "a")
+
+
+def test_balanced_export_retry_preserves_selected_snapshot(tmp_path: Path):
+    root = tmp_path / "project"
+    service = EngineService()
+    service.handle("create_project", {"name": "balanced", "root_path": str(root)})
+    store = ProjectStore(root)
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"fixture")
+    video = store.link_video({
+        "source_path": str(source), "source_size_bytes": source.stat().st_size,
+        "source_mtime_ns": source.stat().st_mtime_ns, "duration_ms": 20000,
+        "width": 960, "height": 720, "fps": 30.0,
+        "video_codec": "h264", "audio_codec": "aac",
+    })
+    reference = store.create_player("A")
+    other = store.create_player("B")
+    rows = []
+    for i in range(5):
+        rows.append({
+            "id": f"c{i}", "video_id": video["id"], "event_time_ms": i * 1000,
+            "default_start_ms": i * 1000, "default_end_ms": i * 1000 + 500,
+            "review_start_ms": i * 1000, "review_end_ms": i * 1000 + 500,
+            "detector_version": "test", "evidence_json": "{}",
+        })
+    store.replace_candidates(video["id"], rows)
+    for i in range(5):
+        store.set_candidate_player(f"c{i}", reference["id"] if i == 0 else other["id"])
+    attempts = []
+
+    def fake_export(payload, **_kwargs):
+        attempts.append([item["id"] for item in payload["candidate_snapshot"]])
+        if len(attempts) == 1:
+            raise RuntimeError("interrupted")
+        return {"export": {"id": "done"}, "files": []}
+
+    service._execute_export = fake_export
+    started = service.handle("start_export", {
+        "project_root": str(root), "video_id": video["id"], "mode": "merge_balanced",
+        "reference_player_id": reference["id"],
+        "player_ids": [reference["id"], other["id"]],
+    })
+    service._job_threads[started["job"]["id"]].join(timeout=2)
+    checkpoint = json.loads(store.get_job(started["job"]["id"])["checkpoint_json"])
+    assert checkpoint["candidate_count"] == 2
+    assert "c0" in attempts[0]
+    retried = service.handle("retry_export", {"project_root": str(root), "job_id": started["job"]["id"]})
+    service._job_threads[retried["job"]["id"]].join(timeout=2)
+    assert attempts == [attempts[0], attempts[0]]
+
+
 def test_standalone_merge_requires_two_videos_without_a_project(tmp_path):
     service = EngineService()
     with pytest.raises(ProtocolError) as error:

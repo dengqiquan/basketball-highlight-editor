@@ -561,6 +561,13 @@ def merge_overlapping_candidates(candidates):
     return merged
 
 
+def merge_overlapping_candidates_by_player(candidates):
+    groups = {}
+    for candidate in candidates:
+        groups.setdefault(candidate.get("player_id"), []).append(candidate)
+    return [clip for group in groups.values() for clip in merge_overlapping_candidates(group)]
+
+
 def merge_duplicate_auto_candidates(candidates, max_event_gap_ms=2500):
     """Join nearby automatic detections of one play before writing clips."""
     def same_rim(left, right):
@@ -639,13 +646,17 @@ def export_goal_clips(
     cancel_check=None,
     process_callback=None,
     effect: str = "none",
+    keep_player_groups: bool = False,
 ) -> Dict[str, Any]:
     if mode not in {"separate", "merge"}:
         raise ValueError("INVALID_EXPORT_MODE")
     original_count = len(candidates)
     candidates = merge_duplicate_auto_candidates(candidates)
     if mode == "merge" and effect == "none":
-        candidates = merge_overlapping_candidates(candidates)
+        candidates = (
+            merge_overlapping_candidates_by_player(candidates)
+            if keep_player_groups else merge_overlapping_candidates(candidates)
+        )
     merged_overlap_count = original_count - len(candidates)
     started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)

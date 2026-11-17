@@ -58,7 +58,10 @@ void main() {
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
   testWidgets('standalone merge opens beside return to review', (tester) async {
-    await _pumpFilterExport(tester, _FilterExportNotifier(const ProjectState()));
+    await _pumpFilterExport(
+      tester,
+      _FilterExportNotifier(const ProjectState()),
+    );
     expect(find.byKey(const Key('open-standalone-merge')), findsOneWidget);
     await tester.tap(find.byKey(const Key('open-standalone-merge')));
     await tester.pumpAndSettle();
@@ -143,6 +146,28 @@ void main() {
     expect(notifier.exportedOutputPath, isNull);
   });
 
+  testWidgets('balanced tag merge uses reference tag and one output file', (
+    tester,
+  ) async {
+    final notifier = _FilterExportNotifier(_filterState());
+    final picker = _TestOutputPicker();
+    await _pumpFilterExport(tester, notifier, picker: picker);
+    final mode = find.byKey(const Key('export-mode-balanced'));
+    await tester.ensureVisible(mode);
+    await tester.tap(mode);
+    await tester.pumpAndSettle();
+    await _pickFilter(tester, 'Alice');
+    await _pickFilter(tester, 'Bob');
+    final reference = find.byKey(const Key('export-reference-p1'));
+    await tester.ensureVisible(reference);
+    await tester.tap(reference);
+    await tester.pumpAndSettle();
+    await _exportFiltered(tester, picker);
+    expect(notifier.exportedMode, 'merge_balanced');
+    expect(notifier.exportedReferencePlayerId, 'p1');
+    expect(notifier.exportedOutputPath, '/tmp/filter-regression.mp4');
+  });
+
   testWidgets('the per-tag option only appears when the project has tags', (
     tester,
   ) async {
@@ -167,7 +192,12 @@ void main() {
           {'id': 'p1', 'name': 'Alice'},
         ],
         candidates: [
-          {'id': 'a', 'event_time_ms': 60000, 'player_id': 'p1', 'review_status': 'included'},
+          {
+            'id': 'a',
+            'event_time_ms': 60000,
+            'player_id': 'p1',
+            'review_status': 'included',
+          },
           {'id': 'b', 'event_time_ms': 720000, 'review_status': 'pending'},
           {
             'id': 'c',
@@ -527,6 +557,7 @@ class _FilterExportNotifier extends _ExportNotifier {
   String? exportedEffect;
   String? exportedOutputDir;
   String? exportedOutputPath;
+  String? exportedReferencePlayerId;
 
   void replace(ProjectState value) => state = value;
 
@@ -538,6 +569,7 @@ class _FilterExportNotifier extends _ExportNotifier {
     List<String>? playerIds,
     bool? includeUnassigned,
     String effect = 'none',
+    String? referencePlayerId,
   }) async {
     exportedMode = mode;
     exportedEffect = effect;
@@ -545,6 +577,7 @@ class _FilterExportNotifier extends _ExportNotifier {
     exportedOutputPath = outputPath;
     exportedPlayerIds = playerIds;
     exportedIncludeUnassigned = includeUnassigned;
+    exportedReferencePlayerId = referencePlayerId;
   }
 }
 
@@ -644,6 +677,7 @@ class _TrackingExportNotifier extends _ExportNotifier {
     List<String>? playerIds,
     bool? includeUnassigned,
     String effect = 'none',
+    String? referencePlayerId,
   }) async {
     exports.add('$mode:${outputPath ?? outputDir}');
   }

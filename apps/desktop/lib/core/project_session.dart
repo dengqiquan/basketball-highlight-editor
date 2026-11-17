@@ -14,7 +14,8 @@ String canonicalProjectPath(String path) {
 /// 默认项目目录建不了项目时的备用目录，放在应用数据目录里，不受「受控文件夹访问」保护。
 String fallbackProjectsRoot(Map<String, String> env) {
   final home = env['HOME'] ?? env['USERPROFILE'] ?? Directory.systemTemp.path;
-  if (Platform.isWindows) return '${env['LOCALAPPDATA'] ?? home}\\BHE\\Projects';
+  if (Platform.isWindows)
+    return '${env['LOCALAPPDATA'] ?? home}\\BHE\\Projects';
   if (Platform.isMacOS) return '$home/Library/Application Support/BHE/Projects';
   return '${env['XDG_DATA_HOME'] ?? '$home/.local/share'}/bhe/projects';
 }
@@ -640,6 +641,7 @@ class ProjectSession {
 
   Future<JsonMap> startExport({
     String mode = 'separate',
+    String? referencePlayerId,
     String? outputDir,
     String? outputPath,
     List<String>? playerIds,
@@ -649,6 +651,7 @@ class ProjectSession {
     return engine.startExport(
       projectRoot: _requireProjectRoot(),
       mode: mode,
+      referencePlayerId: referencePlayerId,
       outputDir: outputDir,
       outputPath: outputPath,
       playerIds: playerIds,

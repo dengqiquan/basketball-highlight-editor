@@ -524,6 +524,7 @@ class EngineSession {
 
   Future<JsonMap> startExport({
     required String projectRoot,
+    String? referencePlayerId,
     String? videoId,
     String mode = 'separate',
     String? outputDir,
@@ -536,6 +537,7 @@ class EngineSession {
       'project_root': projectRoot,
       ...?_optionalEntry('video_id', videoId),
       'mode': mode,
+      ...?_optionalEntry('reference_player_id', referencePlayerId),
       ...?_optionalEntry('output_dir', outputDir),
       ...?_optionalEntry('output_path', outputPath),
       ...?_optionalEntry('player_ids', playerIds),

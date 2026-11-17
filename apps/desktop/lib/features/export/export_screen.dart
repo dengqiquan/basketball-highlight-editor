@@ -38,6 +38,7 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
   bool _showFastRisk = true;
   bool _choosingOutput = false;
   String _mode = 'merge';
+  String? _referencePlayerId;
   String _effect = 'none';
 
   static const _effectKey = 'export_goal_effect';
@@ -47,7 +48,10 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
     super.initState();
     SharedPreferences.getInstance().then((prefs) {
       final saved = prefs.getString(_effectKey);
-      if (mounted && saved != null && saved != _effect && _kEffects.contains(saved)) {
+      if (mounted &&
+          saved != null &&
+          saved != _effect &&
+          _kEffects.contains(saved)) {
         setState(() => _effect = saved);
       }
     });
@@ -55,7 +59,9 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
 
   void _setEffect(String value) {
     setState(() => _effect = value);
-    SharedPreferences.getInstance().then((prefs) => prefs.setString(_effectKey, value));
+    SharedPreferences.getInstance().then(
+      (prefs) => prefs.setString(_effectKey, value),
+    );
   }
 
   @override
@@ -68,11 +74,32 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
     final l10n = Localizations.of<BheLocalizations>(context, BheLocalizations);
 
     // 标签全删了以后，「按标签导出」的卡片不再显示，回到合并导出。
-    final mode = state.players.isEmpty && _mode == 'merge_by_player'
+    final mode =
+        state.players.isEmpty &&
+            (_mode == 'merge_by_player' || _mode == 'merge_balanced')
         ? 'merge'
         : _mode;
     final includedCandidates = _filteredCandidates(state);
-    final includedCount = includedCandidates.length;
+    final referenceCount = includedCandidates
+        .where((item) => item['player_id']?.toString() == _referencePlayerId)
+        .length;
+    final balancedCounts = <String?, int>{};
+    for (final item in includedCandidates) {
+      final id = item['player_id']?.toString();
+      balancedCounts[id] = (balancedCounts[id] ?? 0) + 1;
+    }
+    final includedCount = mode == 'merge_balanced'
+        ? (_playerFilterActive &&
+                  _referencePlayerId != null &&
+                  _selectedPlayerIds.contains(_referencePlayerId) &&
+                  referenceCount > 0
+              ? balancedCounts.values.fold<int>(
+                  0,
+                  (sum, count) =>
+                      sum + (count < referenceCount ? count : referenceCount),
+                )
+              : 0)
+        : includedCandidates.length;
     final durationMs = includedCandidates.fold<int>(
       0,
       (total, item) => _effectDuration(total, item, _effect),
@@ -235,9 +262,55 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
                   onTap: () => setState(() => _mode = 'merge_by_player'),
                 ),
               ),
+              const SizedBox(width: Spacing.sm),
+              Expanded(
+                child: _ModeCard(
+                  key: const Key('export-mode-balanced'),
+                  title: context.bheText('按标签均衡合并'),
+                  description: context.bheText(
+                    '以一个标签的片段数为基准，各标签随机选取，合成一个 MP4。',
+                  ),
+                  selected: mode == 'merge_balanced',
+                  onTap: () => setState(() => _mode = 'merge_balanced'),
+                ),
+              ),
             ],
           ],
         ),
+        if (mode == 'merge_balanced') ...[
+          const SizedBox(height: Spacing.md),
+          _ExportSection(
+            title: context.bheText('基准标签'),
+            hint: context.bheText(
+              _playerFilterActive
+                  ? '选择一个已勾选的标签；每个标签最多取相同数量的片段'
+                  : '先在导出范围中选择参与的标签',
+            ),
+            child: Wrap(
+              spacing: Spacing.xs,
+              children: [
+                for (final player in state.players)
+                  if (_selectedPlayerIds.contains(player['id']?.toString()) &&
+                      _playerCount(state, player['id']?.toString()) > 0)
+                    _ScopeChip(
+                      key: Key('export-reference-${player['id']}'),
+                      label: player['name']?.toString() ?? '',
+                      count: _playerCount(state, player['id']?.toString()),
+                      selected: _referencePlayerId == player['id']?.toString(),
+                      onSelected: (_) => setState(
+                        () => _referencePlayerId = player['id']?.toString(),
+                      ),
+                    ),
+              ],
+            ),
+          ),
+          if (referenceCount > 0)
+            Text(
+              context.bheText(
+                '每个标签最多取 $referenceCount 个片段，本次预计 $includedCount 个',
+              ),
+            ),
+        ],
         const SizedBox(height: Spacing.md),
         _ExportSection(
           title: context.bheText('进球效果'),
@@ -269,7 +342,9 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
               Expanded(
                 child: _ExportStat(
                   label: l10n?.totalDuration ?? '合计时长',
-                  value: _formatMs(durationMs),
+                  value: mode == 'merge_balanced'
+                      ? context.bheText('抽样后计算')
+                      : _formatMs(durationMs),
                 ),
               ),
               Expanded(
@@ -292,8 +367,7 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
           const SizedBox(height: Spacing.sm),
           _ExportNotice(
             color: c.warning,
-            text:
-                l10n?.analysisStillRunning ?? '视频仍在分析，分析完成后才能导出新的候选结果。',
+            text: l10n?.analysisStillRunning ?? '视频仍在分析，分析完成后才能导出新的候选结果。',
           ),
         ],
         if (state.analysisMode == 'fast' && _showFastRisk) ...[
@@ -411,8 +485,7 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
               icon: LucideIcons.history,
               title: l10n?.text('还没有导出记录') ?? '还没有导出记录',
               description:
-                  l10n?.text('完成一次导出后，历史记录会出现在这里。') ??
-                  '完成一次导出后，历史记录会出现在这里。',
+                  l10n?.text('完成一次导出后，历史记录会出现在这里。') ?? '完成一次导出后，历史记录会出现在这里。',
             ),
           ),
       ],
@@ -450,17 +523,16 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
     );
   }
 
-  int _playerCount(ProjectState state, String? playerId) => state.candidates
-      .where(_isIncluded)
-      .where((item) {
+  int _playerCount(ProjectState state, String? playerId) =>
+      state.candidates.where(_isIncluded).where((item) {
         final id = item['player_id']?.toString();
         return playerId == null ? id == null || id.isEmpty : id == playerId;
-      })
-      .length;
+      }).length;
 
   void _resetPlayerFilter() {
     _playerFilterActive = false;
     _selectedPlayerIds.clear();
+    _referencePlayerId = null;
     _includeUnassigned = true;
   }
 
@@ -477,6 +549,9 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
         .whereType<String>()
         .toSet();
     _selectedPlayerIds.removeWhere((id) => !playerIds.contains(id));
+    if (!_selectedPlayerIds.contains(_referencePlayerId)) {
+      _referencePlayerId = null;
+    }
   }
 
   List<Map<String, dynamic>> _filteredCandidates(ProjectState state) {
@@ -492,7 +567,7 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
     ProjectNotifier notifier, {
     required String mode,
   }) async {
-    final merge = mode == 'merge';
+    final merge = mode == 'merge' || mode == 'merge_balanced';
     if (_choosingOutput) return;
     setState(() => _choosingOutput = true);
     final videoId = ref.read(projectProvider).video?['id'];
@@ -523,6 +598,7 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
         outputDir: merge ? null : path,
         playerIds: playerIds,
         includeUnassigned: includeUnassigned,
+        referencePlayerId: mode == 'merge_balanced' ? _referencePlayerId : null,
       );
     } catch (error) {
       if (mounted) {
@@ -667,7 +743,9 @@ class _GameStatsSection extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           Text(
-            context.bheText('保留的进球 ÷ 全部疑似片段。疑似片段里也有不是投篮的，没碰到篮筐的投篮也不在里面，只是粗略估算。'),
+            context.bheText(
+              '保留的进球 ÷ 全部疑似片段。疑似片段里也有不是投篮的，没碰到篮筐的投篮也不在里面，只是粗略估算。',
+            ),
             style: theme.textTheme.labelSmall?.copyWith(color: c.textTertiary),
           ),
           if (playerRows.isNotEmpty) ...[
@@ -697,7 +775,10 @@ class _CountBars extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
     final theme = Theme.of(context);
-    final most = rows.fold<int>(1, (value, row) => row.count > value ? row.count : value);
+    final most = rows.fold<int>(
+      1,
+      (value, row) => row.count > value ? row.count : value,
+    );
     return Column(
       children: [
         for (final row in rows)
@@ -750,6 +831,7 @@ class _CountBars extends StatelessWidget {
 
 class _ScopeChip extends StatelessWidget {
   const _ScopeChip({
+    super.key,
     required this.label,
     required this.count,
     required this.selected,
@@ -1040,9 +1122,7 @@ class _RunningExportCard extends StatelessWidget {
           Text(
             l10n?.text('本次输出使用启动导出时的片段列表，之后的审核修改用于下一次导出。') ??
                 '本次输出使用启动导出时的片段列表，之后的审核修改用于下一次导出。',
-            style: theme.textTheme.labelSmall?.copyWith(
-              color: c.textSecondary,
-            ),
+            style: theme.textTheme.labelSmall?.copyWith(color: c.textSecondary),
           ),
         ],
       ),
@@ -1063,12 +1143,15 @@ class _ExportHistoryCard extends StatelessWidget {
     final mode = switch (item['mode']) {
       'merge' => '合并导出',
       'merge_by_player' => '按标签导出',
+      'merge_balanced' => '按标签均衡合并',
       _ => '分别导出',
     };
     final count = (item['candidate_count'] as num?)?.toInt() ?? 0;
     final duration = (item['duration_ms'] as num?)?.toInt() ?? 0;
     final mergedOverlapCount =
-        ((item['metadata'] as Map?)?['merged_overlap_count'] as num?)?.toInt() ?? 0;
+        ((item['metadata'] as Map?)?['merged_overlap_count'] as num?)
+            ?.toInt() ??
+        0;
     final processing = (item['processing_ms'] as num?)?.toInt() ?? 0;
     final fileSize = (item['file_size_bytes'] as num?)?.toInt() ?? 0;
     final width = (item['width'] as num?)?.toInt();
@@ -1284,11 +1367,7 @@ class _EffectChoice {
 }
 
 List<_EffectChoice> _effectOptions(BuildContext context) => [
-  _EffectChoice(
-    'none',
-    context.bheText('不加效果'),
-    context.bheText('每个片段原样导出。'),
-  ),
+  _EffectChoice('none', context.bheText('不加效果'), context.bheText('每个片段原样导出。')),
   _EffectChoice(
     'approach',
     context.bheText('临门慢动作'),
@@ -1297,7 +1376,9 @@ List<_EffectChoice> _effectOptions(BuildContext context) => [
   _EffectChoice(
     'replay',
     context.bheText('慢放特写回放'),
-    context.bheText('片段播完后，重播入框前后约 0.8 秒的画面：放慢一倍，取景框住篮筐和球的飞行路线，方便看清球进没进。每个进球多约 1.6 秒。'),
+    context.bheText(
+      '片段播完后，重播入框前后约 0.8 秒的画面：放慢一倍，取景框住篮筐和球的飞行路线，方便看清球进没进。每个进球多约 1.6 秒。',
+    ),
   ),
 ];
 
@@ -1305,7 +1386,8 @@ List<_EffectChoice> _effectOptions(BuildContext context) => [
 int _effectDuration(int total, Map<String, dynamic> item, String effect) {
   if (effect == 'none') return _clipDuration(total, item);
   final base = _clipDuration(total, item);
-  if (item['detector_version']?.toString().startsWith('manual') == true) return base;
+  if (item['detector_version']?.toString().startsWith('manual') == true)
+    return base;
   final event = (item['event_time_ms'] as num?)?.toInt();
   if (event == null) return base;
   final start =
@@ -1357,7 +1439,9 @@ class _EffectOption extends StatelessWidget {
             Padding(
               padding: const EdgeInsets.only(top: 2),
               child: Icon(
-                selected ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+                selected
+                    ? Icons.radio_button_checked
+                    : Icons.radio_button_unchecked,
                 size: 18,
                 color: selected ? c.orange : c.textTertiary,
               ),
